@@ -12,7 +12,14 @@
 #   ~/.local/state/als_map/access.log
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve through ~/.local/bin symlink so doctor/status find the repo.
+_SCRIPT_PATH="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  _RESOLVED="$(readlink -f "$_SCRIPT_PATH" 2>/dev/null || true)"
+  [[ -n "$_RESOLVED" ]] && _SCRIPT_PATH="$_RESOLVED"
+fi
+REPO_ROOT="$(cd "$(dirname "$_SCRIPT_PATH")/.." && pwd)"
+unset _SCRIPT_PATH _RESOLVED
 HTTP_UNIT="als-map-mcp-http.service"
 TUNNEL_UNIT="als-map-mcp-tunnel.service"
 CONFIG_DIR="${HOME}/.config/als_map"
