@@ -1,9 +1,8 @@
 # Cloudflare Tunnel stub for ALS Map remote MCP
 #
-# DNS STATUS: mcp.austenstrine.dev is NOT ready yet.
-# Do not rely on that hostname until Austen finishes Namecheap + Cloudflare DNS.
-# This file is an example only — copy locally (e.g. ~/.cloudflared/als-map-mcp.yml)
-# and never commit real tunnel credentials / tokens.
+# Example only — real tunnel config lives under ~/.cloudflared/ (not in git).
+# On Raider the live hostname is mcp.austenstrine.dev; manage the stack with
+# scripts/als_map_stack (see docs/als-map-stack.md). Never commit credentials.
 #
 # Prereqs (when DNS is ready):
 #   1. cloudflared installed

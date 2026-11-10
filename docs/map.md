@@ -111,30 +111,30 @@ curl -sS http://127.0.0.1:8787/mcp \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 ```
 
-### Cloudflare Tunnel (DNS not ready)
+### Stack launcher (Raider)
 
-Example config: [`docs/cloudflare-tunnel.example.yml`](cloudflare-tunnel.example.yml).
+One command for HTTP MCP + Cloudflare tunnel (systemd user units), status panel, access log, desktop icon:
 
-**`mcp.austenstrine.dev` does not exist yet — do not rely on that hostname.** When Austen is ready:
+```bash
+scripts/als_map_stack start          # or: status | stop | restart | logs -f | doctor | watch
+scripts/als_map_stack install-desktop
+```
 
-1. Point the domain at Cloudflare (Namecheap nameservers or CNAME).
-2. `cloudflared tunnel create als-map-mcp` + `tunnel route dns … mcp.austenstrine.dev`.
-3. Ingress → `http://127.0.0.1:8787` while `als_map_mcp_http.py` runs locally (or on the self-hosted box).
-4. Keep `ALS_MAP_MCP_TOKEN` only in the environment / secret store — never in git.
+Details: [`docs/als-map-stack.md`](als-map-stack.md). Access log: `~/.local/state/als_map/access.log` (no bearer values). Token: `~/.config/als_map/mcp_token`.
 
-### Grok custom MCP (once hostname exists)
+### Cloudflare Tunnel
 
-Paste shape (URL + header). **Hostname is future — use localhost for now.**
+Live hostname: **`https://mcp.austenstrine.dev`** (tunnel UUID managed under `~/.cloudflared/`, not in git). Example stub: [`docs/cloudflare-tunnel.example.yml`](cloudflare-tunnel.example.yml).
+
+Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in git.
+
+### Grok / Cursor remote MCP
 
 | Field | Value |
 |-------|-------|
-| URL | `https://mcp.austenstrine.dev/mcp` *(future)* / local: `http://127.0.0.1:8787/mcp` |
+| URL | `https://mcp.austenstrine.dev/mcp` (local: `http://127.0.0.1:8787/mcp`) |
 | Header | `Authorization: Bearer <ALS_MAP_MCP_TOKEN>` |
 | Transport | Streamable HTTP (JSON responses supported) |
-
-### Cursor remote MCP snippet (once hostname exists)
-
-Cursor remote/custom MCP configs vary by build; typical shape:
 
 ```json
 {
@@ -148,8 +148,6 @@ Cursor remote/custom MCP configs vary by build; typical shape:
   }
 }
 ```
-
-Until DNS is live, keep using the **stdio** server above, or point `url` at `http://127.0.0.1:8787/mcp` on the same machine.
 
 ### Tools
 
@@ -184,5 +182,7 @@ Primary ongoing cost is **agent/Grok context tokens**, not index CPU.
 | `scripts/map_query.py` | Debug CLI |
 | `scripts/als_map_mcp.py` | Stdio MCP server |
 | `scripts/als_map_mcp_http.py` | Streamable HTTP MCP + Bearer auth |
+| `scripts/als_map_stack` | One-command start/stop/status/logs/doctor + desktop launcher |
+| `assets/als-map-mcp.svg` | Desktop icon for ALS Map MCP |
 | `docs/cloudflare-tunnel.example.yml` | Tunnel stub (DNS not ready) |
 | `data/index/` | Generated index (gitignored) |

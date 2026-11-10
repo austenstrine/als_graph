@@ -19,6 +19,7 @@ Env:
   ALS_MAP_DB          optional sqlite path
   ALS_MAP_MCP_ALLOWED_ORIGINS  comma list; empty = allow missing Origin + localhost
   ALS_MAP_MCP_ALLOW_NONLOCAL   set to 1 to bind non-loopback (default refuse)
+  ALS_MAP_ACCESS_LOG  access log path (default ~/.local/state/als_map/access.log)
 
 DNS note: mcp.austenstrine.dev is NOT assumed to exist yet — run locally /
 behind a tunnel stub until Namecheap + Cloudflare are ready.
@@ -54,6 +55,60 @@ DEFAULT_PORT = 8787
 MCP_PATH = "/mcp"
 MAX_BODY_BYTES = 1_048_576  # 1 MiB JSON-RPC body cap
 SESSION_TTL_SEC = 3600
+DEFAULT_ACCESS_LOG = Path.home() / ".local" / "state" / "als_map" / "access.log"
+_ACCESS_LOG_LOCK = threading.Lock()
+
+
+def access_log_path() -> Path:
+    raw = os.environ.get("ALS_MAP_ACCESS_LOG", "").strip()
+    return Path(raw).expanduser() if raw else DEFAULT_ACCESS_LOG
+
+
+def write_access_log(
+    *,
+    client_ip: str,
+    method: str,
+    path: str,
+    status: int,
+    mcp_method: str | None = None,
+    tool: str | None = None,
+) -> None:
+    """Append one access line. Never logs Authorization / bearer values."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    fields = [
+        ts,
+        client_ip or "-",
+        method or "-",
+        path or "-",
+        str(status),
+        mcp_method or "-",
+        tool or "-",
+    ]
+    # Space-separated; no header values — keep parseable and secret-safe.
+    line = " ".join(fields) + "\n"
+    path_out = access_log_path()
+    try:
+        path_out.parent.mkdir(parents=True, exist_ok=True)
+        with _ACCESS_LOG_LOCK:
+            with path_out.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+    except OSError as exc:
+        log(f"access log write failed: {exc}")
+
+
+def parse_mcp_meta(msg: Any) -> tuple[str | None, str | None]:
+    """Return (jsonrpc_method, tool_name) when parseable from a JSON-RPC object."""
+    if not isinstance(msg, dict):
+        return None, None
+    mcp_method = msg.get("method") if isinstance(msg.get("method"), str) else None
+    tool = None
+    if mcp_method == "tools/call":
+        params = msg.get("params")
+        if isinstance(params, dict):
+            name = params.get("name")
+            if isinstance(name, str) and name:
+                tool = name
+    return mcp_method, tool
 
 
 def require_token() -> str:
@@ -188,6 +243,35 @@ class MCPHandler(BaseHTTPRequestHandler):
             rendered = "<redacted request log>"
         log(f"{self.address_string()} - {rendered}")
 
+    def _client_ip(self) -> str:
+        for header in ("CF-Connecting-IP", "True-Client-IP", "X-Real-IP"):
+            value = (self.headers.get(header) or "").strip()
+            if value:
+                return value
+        xff = (self.headers.get("X-Forwarded-For") or "").strip()
+        if xff:
+            return xff.split(",")[0].strip() or self.client_address[0]
+        return self.client_address[0]
+
+    def _request_path(self) -> str:
+        return urlparse(self.path).path.rstrip("/") or "/"
+
+    def _access(
+        self,
+        status: int,
+        path: str | None = None,
+        mcp_method: str | None = None,
+        tool: str | None = None,
+    ) -> None:
+        write_access_log(
+            client_ip=self._client_ip(),
+            method=self.command or "-",
+            path=path or self._request_path(),
+            status=status,
+            mcp_method=mcp_method,
+            tool=tool,
+        )
+
     def _read_body(self) -> bytes | None:
         raw_len = self.headers.get("Content-Length") or "0"
         try:
@@ -207,7 +291,18 @@ class MCPHandler(BaseHTTPRequestHandler):
             return None
         return self.rfile.read(length) if length > 0 else b""
 
-    def _send(self, code: int, body: bytes, content_type: str, extra: dict[str, str] | None = None) -> None:
+    def _send(
+        self,
+        code: int,
+        body: bytes,
+        content_type: str,
+        extra: dict[str, str] | None = None,
+        *,
+        path: str | None = None,
+        mcp_method: str | None = None,
+        tool: str | None = None,
+        access: bool = True,
+    ) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -218,35 +313,46 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
+        if access:
+            self._access(code, path=path, mcp_method=mcp_method, tool=tool)
 
-    def _unauthorized(self) -> None:
+    def _send_empty(self, code: int, extra: dict[str, str] | None = None, **access_kw: Any) -> None:
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self._access(code, **access_kw)
+
+    def _unauthorized(self, path: str | None = None) -> None:
         body = _json_bytes({"error": "unauthorized", "hint": "Authorization: Bearer <ALS_MAP_MCP_TOKEN>"})
-        self._send(401, body, "application/json", {"WWW-Authenticate": "Bearer"})
+        self._send(401, body, "application/json", {"WWW-Authenticate": "Bearer"}, path=path)
 
-    def _forbidden_origin(self) -> None:
+    def _forbidden_origin(self, path: str | None = None) -> None:
         body = _json_bytes({"jsonrpc": "2.0", "error": {"code": -32000, "message": "invalid Origin"}, "id": None})
-        self._send(403, body, "application/json")
+        self._send(403, body, "application/json", path=path)
 
-    def _check_auth(self) -> bool:
+    def _check_auth(self, path: str | None = None) -> bool:
         header = self.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
-            self._unauthorized()
+            self._unauthorized(path=path)
             return False
         got = header[len("Bearer ") :].strip()
         if not got or not secrets.compare_digest(got, self.expected_token):
-            self._unauthorized()
+            self._unauthorized(path=path)
             return False
         return True
 
-    def _check_origin(self) -> bool:
+    def _check_origin(self, path: str | None = None) -> bool:
         origin = self.headers.get("Origin")
         if origin_ok(origin):
             return True
-        self._forbidden_origin()
+        self._forbidden_origin(path=path)
         return False
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path.rstrip("/") or "/"
+        path = self._request_path()
         if path == "/health":
             body = _json_bytes(
                 {
@@ -257,20 +363,25 @@ class MCPHandler(BaseHTTPRequestHandler):
                     "mcp_path": MCP_PATH,
                 }
             )
-            self._send(200, body, "application/json")
+            self._send(200, body, "application/json", path=path)
             return
 
         if path != MCP_PATH.rstrip("/") and path != "/mcp":
-            self._send(404, _json_bytes({"error": "not found"}), "application/json")
+            self._send(404, _json_bytes({"error": "not found"}), "application/json", path=path)
             return
 
-        if not self._check_origin() or not self._check_auth():
+        if not self._check_origin(path=path) or not self._check_auth(path=path):
             return
 
         # Optional long-lived SSE listen; we advertise capability but keep a short idle stream.
         accept = self.headers.get("Accept", "")
         if "text/event-stream" not in accept:
-            self._send(405, _json_bytes({"error": "GET requires Accept: text/event-stream"}), "application/json")
+            self._send(
+                405,
+                _json_bytes({"error": "GET requires Accept: text/event-stream"}),
+                "application/json",
+                path=path,
+            )
             return
 
         sid = self.headers.get("Mcp-Session-Id")
@@ -281,6 +392,7 @@ class MCPHandler(BaseHTTPRequestHandler):
         for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
+        self._access(200, path=path, mcp_method="sse")
         # Prime reconnect id, then close (clients may poll).
         try:
             self.wfile.write(b"id: 0\ndata: \n\n")
@@ -289,12 +401,12 @@ class MCPHandler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path.rstrip("/") or "/"
+        path = self._request_path()
         if path != MCP_PATH.rstrip("/") and path != "/mcp":
-            self._send(404, _json_bytes({"error": "not found"}), "application/json")
+            self._send(404, _json_bytes({"error": "not found"}), "application/json", path=path)
             return
 
-        if not self._check_origin() or not self._check_auth():
+        if not self._check_origin(path=path) or not self._check_auth(path=path):
             return
 
         raw = self._read_body()
@@ -303,12 +415,19 @@ class MCPHandler(BaseHTTPRequestHandler):
         try:
             msg = json.loads(raw.decode("utf-8") if raw else "{}")
         except json.JSONDecodeError:
-            self._send(400, _json_bytes({"error": "invalid JSON"}), "application/json")
+            self._send(400, _json_bytes({"error": "invalid JSON"}), "application/json", path=path)
             return
 
         if not isinstance(msg, dict):
-            self._send(400, _json_bytes({"error": "JSON-RPC message must be an object"}), "application/json")
+            self._send(
+                400,
+                _json_bytes({"error": "JSON-RPC message must be an object"}),
+                "application/json",
+                path=path,
+            )
             return
+
+        mcp_method, tool = parse_mcp_meta(msg)
 
         # Notifications / responses: 202 Accepted, no body
         is_notification = "id" not in msg and msg.get("method")
@@ -319,11 +438,9 @@ class MCPHandler(BaseHTTPRequestHandler):
                     handle_message(msg)
             except Exception:  # noqa: BLE001
                 log(traceback.format_exc())
-                self._send(400, b"", "application/json")
+                self._send(400, b"", "application/json", path=path, mcp_method=mcp_method, tool=tool)
                 return
-            self.send_response(202)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._send_empty(202, path=path, mcp_method=mcp_method, tool=tool)
             return
 
         # Requests
@@ -333,9 +450,7 @@ class MCPHandler(BaseHTTPRequestHandler):
 
         if method == "notifications/initialized":
             # Should arrive as notification (no id); defensive
-            self.send_response(202)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._send_empty(202, path=path, mcp_method=mcp_method, tool=tool)
             return
 
         try:
@@ -364,11 +479,8 @@ class MCPHandler(BaseHTTPRequestHandler):
             # Unknown / missing session: still serve (stateless OK).
 
         if resp is None:
-            self.send_response(202)
-            self.send_header("Content-Length", "0")
-            if session_header:
-                self.send_header("Mcp-Session-Id", session_header)
-            self.end_headers()
+            extra_out = {"Mcp-Session-Id": session_header} if session_header else None
+            self._send_empty(202, extra=extra_out, path=path, mcp_method=mcp_method, tool=tool)
             return
 
         accept = self.headers.get("Accept", "")
@@ -377,24 +489,39 @@ class MCPHandler(BaseHTTPRequestHandler):
         if prefer_sse:
             body = _sse_bytes(resp)
             # Include priming empty event? Spec wants eventual response; one event is enough.
-            self._send(200, body, "text/event-stream", extra)
+            self._send(
+                200,
+                body,
+                "text/event-stream",
+                extra,
+                path=path,
+                mcp_method=mcp_method,
+                tool=tool,
+            )
         else:
-            self._send(200, _json_bytes(resp), "application/json", extra)
+            self._send(
+                200,
+                _json_bytes(resp),
+                "application/json",
+                extra,
+                path=path,
+                mcp_method=mcp_method,
+                tool=tool,
+            )
 
     def do_DELETE(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path.rstrip("/") or "/"
+        path = self._request_path()
         if path not in {MCP_PATH.rstrip("/"), "/mcp"}:
-            self._send(404, _json_bytes({"error": "not found"}), "application/json")
+            self._send(404, _json_bytes({"error": "not found"}), "application/json", path=path)
             return
-        if not self._check_origin() or not self._check_auth():
+        if not self._check_origin(path=path) or not self._check_auth(path=path):
             return
         SESSIONS.drop(self.headers.get("Mcp-Session-Id"))
-        self.send_response(204)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self._send_empty(204, path=path)
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         # Minimal CORS preflight for browser-based clients; auth still required on real calls.
+        path = self._request_path()
         self.send_response(204)
         origin = self.headers.get("Origin", "")
         if origin and origin_ok(origin):
@@ -408,6 +535,7 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", "0")
         self.end_headers()
+        self._access(204, path=path)
 
 
 def main() -> int:
@@ -424,6 +552,7 @@ def main() -> int:
         f"(protocol {HTTP_PROTOCOL_VERSION}; health /health; max_body {MAX_BODY_BYTES})"
     )
     log("Auth: Bearer token from ALS_MAP_MCP_TOKEN (required; value never logged)")
+    log(f"Access log: {access_log_path()} (ts ip method path status mcp_method tool)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
