@@ -2,7 +2,8 @@
 
 Measured on host `austen-loren-strine-Raider-GE68HX-13VF` at **2026-11-10T05:48:12Z**.
 
-Index target path (preferred): `/home/austen-loren-strine/Development/als_graph/data/`  
+Index target path (preferred): `/ABS/PATH/TO/als_graph/data/`  
+
 Filesystem: `/` on `/dev/nvme0n1p4` (ext4).
 
 ## Disk

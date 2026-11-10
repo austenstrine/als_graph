@@ -88,9 +88,9 @@ Add to Cursor MCP settings (path may vary by machine):
 {
   "mcpServers": {
     "als-map": {
-      "command": "/home/austen-loren-strine/Development/als_graph/.venv/bin/python",
+      "command": "/ABS/PATH/TO/als_graph/.venv/bin/python",
       "args": [
-        "/home/austen-loren-strine/Development/als_graph/scripts/als_map_mcp.py"
+        "/ABS/PATH/TO/als_graph/scripts/als_map_mcp.py"
       ]
     }
   }

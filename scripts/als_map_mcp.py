@@ -15,8 +15,8 @@ Cursor MCP config snippet (user settings):
   {
     "mcpServers": {
       "als-map": {
-        "command": "/home/austen-loren-strine/Development/als_graph/.venv/bin/python",
-        "args": ["/home/austen-loren-strine/Development/als_graph/scripts/als_map_mcp.py"],
+        "command": "/ABS/PATH/TO/als_graph/.venv/bin/python",
+        "args": ["/ABS/PATH/TO/als_graph/scripts/als_map_mcp.py"],
         "env": {}
       }
     }
