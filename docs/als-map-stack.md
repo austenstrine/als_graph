@@ -65,7 +65,7 @@ Alternates: run `als_map_stack watch` from a terminal, or open `~/.local/share/a
 
 The launcher opens a terminal (`gnome-terminal` preferred) running `als_map_stack watch`. Right-click actions: Status / Stop / Doctor.
 
-Icon source in repo: `assets/als-map-mcp.svg`.
+Icon: circular AS logo (`assets/als-map-mcp.png` + scalable `assets/als-map-mcp.svg`), from `~/Pictures/AS_LOGO`.
 
 ## Sample status panel
 

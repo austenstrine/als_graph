@@ -33,7 +33,9 @@ PUBLIC_MCP="https://mcp.austenstrine.dev/mcp"
 DESKTOP_FILE="${HOME}/.local/share/applications/als-map-mcp.desktop"
 ICON_NAME="als-map-mcp"
 ICON_SRC="${REPO_ROOT}/assets/als-map-mcp.svg"
+ICON_PNG_SRC="${REPO_ROOT}/assets/als-map-mcp.png"
 ICON_DST="${HOME}/.local/share/icons/hicolor/scalable/apps/${ICON_NAME}.svg"
+ICON_THEME_ROOT="${HOME}/.local/share/icons/hicolor"
 BIN_LINK="${HOME}/.local/bin/als_map_stack"
 
 bold() { printf '\033[1m%s\033[0m' "$*"; }
@@ -380,6 +382,26 @@ cmd_install_desktop() {
     exit 1
   fi
   install -m 644 "$ICON_SRC" "$ICON_DST"
+
+  # Raster sizes from circular AS logo PNG (sharper than scaling the embedded SVG).
+  if [[ -f "$ICON_PNG_SRC" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - "$ICON_PNG_SRC" "$ICON_THEME_ROOT" "$ICON_NAME" <<'PY'
+import sys
+from pathlib import Path
+from PIL import Image
+src, root, name = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+im = Image.open(src).convert("RGBA")
+for size in (48, 64, 128, 256, 512):
+    dest_dir = root / f"{size}x{size}" / "apps"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    im.resize((size, size), Image.Resampling.LANCZOS).save(dest_dir / f"{name}.png", "PNG", optimize=True)
+PY
+    else
+      mkdir -p "${ICON_THEME_ROOT}/512x512/apps"
+      install -m 644 "$ICON_PNG_SRC" "${ICON_THEME_ROOT}/512x512/apps/${ICON_NAME}.png"
+    fi
+  fi
 
   ln -sfn "$REPO_ROOT/scripts/als_map_stack" "$BIN_LINK"
   chmod +x "$REPO_ROOT/scripts/als_map_stack"
