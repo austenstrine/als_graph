@@ -1,0 +1,31 @@
+# Cloudflare Tunnel stub for ALS Map remote MCP
+#
+# Example only — real tunnel config lives under ~/.cloudflared/ (not in git).
+# On Raider the live hostname is mcp.austenstrine.dev; manage the stack with
+# scripts/als_map_stack (see docs/als-map-stack.md). Never commit credentials.
+#
+# Prereqs (when DNS is ready):
+#   1. cloudflared installed
+#   2. Cloudflare account owns austenstrine.dev (or a CNAME target)
+#   3. Local HTTP MCP listening on 127.0.0.1:8787
+#        ALS_MAP_MCP_TOKEN=… python scripts/als_map_mcp_http.py
+#
+# Create a named tunnel (once):
+#   cloudflared tunnel login
+#   cloudflared tunnel create als-map-mcp
+#   # note the Tunnel UUID and credentials JSON path printed by the CLI
+#
+# Route DNS (ONLY when ready to cut over — Austen / Namecheap / Cloudflare):
+#   cloudflared tunnel route dns als-map-mcp mcp.austenstrine.dev
+#   # or manually: CNAME mcp -> <TUNNEL_UUID>.cfargotunnel.com (proxied)
+#
+# Run:
+#   cloudflared tunnel --config /path/to/this-file.yml run
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /path/to/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: mcp.austenstrine.dev   # FUTURE — DNS not ready; do not depend on this yet
+    service: http://127.0.0.1:8787
+  - service: http_status:404

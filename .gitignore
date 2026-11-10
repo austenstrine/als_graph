@@ -1,0 +1,58 @@
+# xAI / Grok account export (hundreds of MB) — never commit
+10b2e090-7b79-4786-bf86-6e2da0cd437e/
+**/prod-grok-backend.json
+**/prod-mc-asset-server/
+**/export_data/
+
+# Official X/Twitter archive (GB-scale with media) — never commit
+twitter-*/
+*.zip
+
+# Normalized corpora (large JSONL) — generate locally, do not commit
+data/normalized/*.jsonl
+data/normalized/*.jsonl.gz
+
+# Keep stats sidecar trackable (small); ignore accidental dumps
+# data/normalized/*-stats.json is OK to commit (scrub absolute paths for public)
+
+# Map FTS index (sqlite + WAL/SHM + local stats) — generate locally, do not commit
+data/index/
+
+# Embeddings / vector artifacts — generate locally, do not commit
+data/embeddings/
+data/vectors/
+**/*.faiss
+**/*embeddings*.sqlite
+**/*embed*.bin
+**/*embed*.npy
+
+# Secrets / tokens / tunnel creds (live under $HOME; never commit)
+.env
+.env.*
+!.env.example
+mcp_token
+**/mcp_token
+**/credentials.json
+**/*credentials*.json
+.cloudflared/
+**/.cloudflared/
+*.pem
+
+# Access / runtime logs
+access.log
+**/access.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local probes / scratch
+_probe_export.py
+*.tmp

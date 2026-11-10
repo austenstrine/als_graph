@@ -1,0 +1,45 @@
+{
+  "source": "grok_chat",
+  "known_sources_extension_point": [
+    "grok_chat",
+    "x_post",
+    "x_like",
+    "x_reply"
+  ],
+  "input": "<local-grok-export>/prod-grok-backend.json",
+  "output": "data/normalized/grok.jsonl",
+  "conversations": 1987,
+  "records": 14994,
+  "projects_indexed": 7,
+  "conversations_with_workspace": 77,
+  "empty_text_records": 147,
+  "roles": {
+    "human": 7467,
+    "assistant": 7527
+  },
+  "sender_raw": {
+    "human": 7467,
+    "assistant": 4330,
+    "ASSISTANT": 3190,
+    "model": 7
+  },
+  "models": {
+    "grok-4": 3852,
+    "grok-3": 2113,
+    "grok-4-mini-thinking-analyze": 380,
+    "grok-3-latest": 174,
+    "build": 8,
+    "grok-v9-4p5-chat-expert": 46,
+    "grok-420-low-0327a-cloud-w-computer": 2,
+    "grok-4p3-0430-v2-s320-memory": 17,
+    "grok-4-auto": 873,
+    "grok-420-computer-use-sa": 340,
+    "grok-4-mini-thinking-tahoe": 66,
+    "grok-2a": 853,
+    "grok-2-latest": 50,
+    "grok-2-mini-latest": 440,
+    "grok-2v-mini-sglang": 92
+  },
+  "elapsed_seconds": 2.213,
+  "generated_at": "2026-11-07T22:48:45Z"
+}

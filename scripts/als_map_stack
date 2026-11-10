@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+# als_map_stack — one-command control plane for ALS Map MCP HTTP + Cloudflare tunnel.
+#
+# Usage:
+#   als_map_stack start|stop|restart|status|logs|doctor|watch|install-desktop
+#
+# Manages existing systemd --user units:
+#   als-map-mcp-http.service
+#   als-map-mcp-tunnel.service
+#
+# Secrets stay in ~/.config/als_map/ (never printed). Access log:
+#   ~/.local/state/als_map/access.log
+set -euo pipefail
+
+# Resolve through ~/.local/bin symlink so doctor/status find the repo.
+_SCRIPT_PATH="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  _RESOLVED="$(readlink -f "$_SCRIPT_PATH" 2>/dev/null || true)"
+  [[ -n "$_RESOLVED" ]] && _SCRIPT_PATH="$_RESOLVED"
+fi
+REPO_ROOT="$(cd "$(dirname "$_SCRIPT_PATH")/.." && pwd)"
+unset _SCRIPT_PATH _RESOLVED
+HTTP_UNIT="als-map-mcp-http.service"
+TUNNEL_UNIT="als-map-mcp-tunnel.service"
+CONFIG_DIR="${HOME}/.config/als_map"
+TOKEN_FILE="${CONFIG_DIR}/mcp_token"
+ENV_FILE="${CONFIG_DIR}/env"
+STATE_DIR="${HOME}/.local/state/als_map"
+ACCESS_LOG="${ALS_MAP_ACCESS_LOG:-${STATE_DIR}/access.log}"
+LOCAL_HEALTH="http://127.0.0.1:8787/health"
+PUBLIC_HEALTH="https://mcp.austenstrine.dev/health"
+PUBLIC_MCP="https://mcp.austenstrine.dev/mcp"
+DESKTOP_FILE="${HOME}/.local/share/applications/als-map-mcp.desktop"
+ICON_NAME="als-map-mcp"
+ICON_SRC="${REPO_ROOT}/assets/als-map-mcp.svg"
+ICON_PNG_SRC="${REPO_ROOT}/assets/als-map-mcp.png"
+ICON_DST="${HOME}/.local/share/icons/hicolor/scalable/apps/${ICON_NAME}.svg"
+ICON_THEME_ROOT="${HOME}/.local/share/icons/hicolor"
+BIN_LINK="${HOME}/.local/bin/als_map_stack"
+
+bold() { printf '\033[1m%s\033[0m' "$*"; }
+dim() { printf '\033[2m%s\033[0m' "$*"; }
+green() { printf '\033[32m%s\033[0m' "$*"; }
+red() { printf '\033[31m%s\033[0m' "$*"; }
+yellow() { printf '\033[33m%s\033[0m' "$*"; }
+
+ok() { green "ok"; }
+bad() { red "FAIL"; }
+warn() { yellow "warn"; }
+
+usage() {
+  cat <<EOF
+als_map_stack — ALS Map MCP HTTP + Cloudflare tunnel
+
+Commands:
+  start             Ensure token, enable+start units, print status
+  stop              Stop both units
+  restart           Restart both units, print status
+  status            Status panel (units, health, recent access)
+  logs [-f] [N]     Tail access log (default 50 lines; -f follow)
+  doctor            Health checklist for required pieces
+  watch             Start (if needed) then refresh status + follow access log
+  install-desktop   Install desktop entry + icon + ~/.local/bin symlink
+
+Env:
+  ALS_MAP_ACCESS_LOG  override access log path
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$(dirname "$ACCESS_LOG")"
+}
+
+ensure_token() {
+  ensure_dirs
+  local token=""
+  if [[ -f "$TOKEN_FILE" ]]; then
+    token="$(tr -d ' \t\r\n' <"$TOKEN_FILE")"
+  fi
+  if [[ -z "$token" && -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    token="$(
+      set -a
+      # shellcheck source=/dev/null
+      source "$ENV_FILE"
+      set +a
+      printf '%s' "${ALS_MAP_MCP_TOKEN:-}"
+    )"
+    token="$(printf '%s' "$token" | tr -d ' \t\r\n')"
+  fi
+  if [[ -z "$token" ]]; then
+    token="$(openssl rand -hex 32)"
+    printf '%s\n' "$token" >"$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    printf 'ALS_MAP_MCP_TOKEN=%s\n' "$token" >"$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    echo "Generated new MCP bearer token → $TOKEN_FILE (+ $ENV_FILE)"
+    return 0
+  fi
+  # Keep file + EnvironmentFile aligned without echoing the secret.
+  printf '%s\n' "$token" >"$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+  if [[ ! -f "$ENV_FILE" ]] || ! grep -q '^ALS_MAP_MCP_TOKEN=' "$ENV_FILE" 2>/dev/null; then
+    printf 'ALS_MAP_MCP_TOKEN=%s\n' "$token" >"$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  else
+    # Rewrite only the token line; preserve other keys if any appear later.
+    local tmp
+    tmp="$(mktemp)"
+    awk -v t="$token" '
+      BEGIN{done=0}
+      /^ALS_MAP_MCP_TOKEN=/ {print "ALS_MAP_MCP_TOKEN=" t; done=1; next}
+      {print}
+      END{if(!done) print "ALS_MAP_MCP_TOKEN=" t}
+    ' "$ENV_FILE" >"$tmp"
+    mv "$tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  fi
+}
+
+unit_state() {
+  systemctl --user is-active "$1" 2>/dev/null || echo "inactive"
+}
+
+unit_enabled() {
+  systemctl --user is-enabled "$1" 2>/dev/null || echo "disabled"
+}
+
+http_probe() {
+  # prints: CODE|BODY_SNIP
+  local url="$1"
+  local out code body
+  out="$(curl -sS -m 5 -w '\n%{http_code}' "$url" 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    printf '000|'
+    return
+  fi
+  code="$(printf '%s' "$out" | tail -n1)"
+  body="$(printf '%s' "$out" | sed '$d' | tr '\n' ' ' | cut -c1-120)"
+  printf '%s|%s' "$code" "$body"
+}
+
+fmt_probe() {
+  local label="$1" url="$2"
+  local raw code body
+  raw="$(http_probe "$url")"
+  code="${raw%%|*}"
+  body="${raw#*|}"
+  if [[ "$code" == "200" ]]; then
+    printf '  %-8s %s  %s\n' "$label" "$(ok) $code" "$(dim "$body")"
+  elif [[ "$code" == "000" ]]; then
+    printf '  %-8s %s  %s\n' "$label" "$(bad) unreachable" "$(dim "$url")"
+  else
+    printf '  %-8s %s  %s\n' "$label" "$(warn) $code" "$(dim "$body")"
+  fi
+}
+
+cmd_start() {
+  ensure_token
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$HTTP_UNIT" "$TUNNEL_UNIT" >/dev/null
+  # Brief settle so /health is ready for the panel.
+  sleep 0.6
+  echo "Started $HTTP_UNIT + $TUNNEL_UNIT"
+  cmd_status
+}
+
+cmd_stop() {
+  systemctl --user stop "$TUNNEL_UNIT" "$HTTP_UNIT" || true
+  echo "Stopped $HTTP_UNIT + $TUNNEL_UNIT"
+  cmd_status
+}
+
+cmd_restart() {
+  ensure_token
+  systemctl --user daemon-reload
+  systemctl --user restart "$HTTP_UNIT" "$TUNNEL_UNIT"
+  sleep 0.8
+  echo "Restarted $HTTP_UNIT + $TUNNEL_UNIT"
+  cmd_status
+}
+
+recent_access() {
+  local n="${1:-8}"
+  if [[ ! -f "$ACCESS_LOG" ]]; then
+    echo "  (no access log yet at $ACCESS_LOG)"
+    return
+  fi
+  tail -n "$n" "$ACCESS_LOG" | sed 's/^/  /'
+}
+
+cmd_status() {
+  ensure_dirs
+  local http_a tun_a http_e tun_e
+  http_a="$(unit_state "$HTTP_UNIT")"
+  tun_a="$(unit_state "$TUNNEL_UNIT")"
+  http_e="$(unit_enabled "$HTTP_UNIT")"
+  tun_e="$(unit_enabled "$TUNNEL_UNIT")"
+
+  echo
+  bold "ALS Map MCP stack"
+  echo
+  echo "  $(dim "repo")     $REPO_ROOT"
+  echo "  $(dim "token")    $TOKEN_FILE $( [[ -s "$TOKEN_FILE" ]] && ok || bad )"
+  echo "  $(dim "env")      $ENV_FILE $( [[ -s "$ENV_FILE" ]] && ok || bad )"
+  echo "  $(dim "access")   $ACCESS_LOG"
+  echo
+  bold "Units"
+  echo
+  printf '  %-28s active=%-8s enabled=%s\n' "$HTTP_UNIT" \
+    "$( [[ "$http_a" == active ]] && ok || bad ) $http_a" "$http_e"
+  printf '  %-28s active=%-8s enabled=%s\n' "$TUNNEL_UNIT" \
+    "$( [[ "$tun_a" == active ]] && ok || bad ) $tun_a" "$tun_e"
+  echo
+  bold "Health"
+  echo
+  fmt_probe "local" "$LOCAL_HEALTH"
+  fmt_probe "public" "$PUBLIC_HEALTH"
+  echo
+  echo "  $(dim "MCP")      $PUBLIC_MCP"
+  echo
+  bold "Recent access (ts ip method path status mcp_method tool)"
+  echo
+  recent_access 8
+  echo
+  bold "Unit journal (last 3 each)"
+  echo
+  echo "  $(dim "$HTTP_UNIT")"
+  journalctl --user -u "$HTTP_UNIT" -n 3 --no-pager 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+  echo "  $(dim "$TUNNEL_UNIT")"
+  journalctl --user -u "$TUNNEL_UNIT" -n 3 --no-pager 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+  echo
+}
+
+cmd_logs() {
+  ensure_dirs
+  local follow=0 lines=50
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow=1; shift ;;
+      -n) lines="$2"; shift 2 ;;
+      [0-9]*) lines="$1"; shift ;;
+      *) echo "Unknown logs arg: $1" >&2; exit 2 ;;
+    esac
+  done
+  touch "$ACCESS_LOG"
+  if [[ "$follow" -eq 1 ]]; then
+    echo "Following $ACCESS_LOG (Ctrl-C to stop)"
+    echo "format: ts ip method path status mcp_method tool"
+    tail -n "$lines" -F "$ACCESS_LOG"
+  else
+    echo "Last $lines lines of $ACCESS_LOG"
+    echo "format: ts ip method path status mcp_method tool"
+    tail -n "$lines" "$ACCESS_LOG" || true
+  fi
+}
+
+cmd_doctor() {
+  ensure_dirs
+  local fail=0
+  echo
+  bold "als_map_stack doctor"
+  echo
+
+  check() {
+    local name="$1" okish="$2" detail="$3"
+    if [[ "$okish" == 1 ]]; then
+      printf '  [%s] %s — %s\n' "$(ok)" "$name" "$detail"
+    else
+      printf '  [%s] %s — %s\n' "$(bad)" "$name" "$detail"
+      fail=1
+    fi
+  }
+
+  [[ -x "$REPO_ROOT/scripts/als_map_mcp_http.py" || -f "$REPO_ROOT/scripts/als_map_mcp_http.py" ]] \
+    && check "http script" 1 "$REPO_ROOT/scripts/als_map_mcp_http.py" \
+    || check "http script" 0 "missing"
+
+  [[ -s "$TOKEN_FILE" ]] && check "mcp_token" 1 "$TOKEN_FILE" || check "mcp_token" 0 "missing/empty"
+  [[ -s "$ENV_FILE" ]] && check "env file" 1 "$ENV_FILE" || check "env file" 0 "missing/empty"
+
+  systemctl --user cat "$HTTP_UNIT" >/dev/null 2>&1 \
+    && check "http unit" 1 "$HTTP_UNIT" || check "http unit" 0 "not installed"
+  systemctl --user cat "$TUNNEL_UNIT" >/dev/null 2>&1 \
+    && check "tunnel unit" 1 "$TUNNEL_UNIT" || check "tunnel unit" 0 "not installed"
+
+  [[ "$(unit_state "$HTTP_UNIT")" == active ]] \
+    && check "http active" 1 "$(unit_state "$HTTP_UNIT")" \
+    || check "http active" 0 "$(unit_state "$HTTP_UNIT")"
+  [[ "$(unit_state "$TUNNEL_UNIT")" == active ]] \
+    && check "tunnel active" 1 "$(unit_state "$TUNNEL_UNIT")" \
+    || check "tunnel active" 0 "$(unit_state "$TUNNEL_UNIT")"
+
+  command -v cloudflared >/dev/null \
+    && check "cloudflared" 1 "$(command -v cloudflared)" \
+    || check "cloudflared" 0 "not on PATH"
+  [[ -f "${HOME}/.cloudflared/config.yml" ]] \
+    && check "tunnel config" 1 "${HOME}/.cloudflared/config.yml" \
+    || check "tunnel config" 0 "missing"
+
+  local raw code
+  raw="$(http_probe "$LOCAL_HEALTH")"
+  code="${raw%%|*}"
+  [[ "$code" == 200 ]] && check "local /health" 1 "$code" || check "local /health" 0 "$code"
+  raw="$(http_probe "$PUBLIC_HEALTH")"
+  code="${raw%%|*}"
+  [[ "$code" == 200 ]] && check "public /health" 1 "$code" || check "public /health" 0 "$code"
+
+  [[ -d "$STATE_DIR" ]] && check "state dir" 1 "$STATE_DIR" || check "state dir" 0 "missing"
+  touch "$ACCESS_LOG" 2>/dev/null \
+    && check "access log writable" 1 "$ACCESS_LOG" \
+    || check "access log writable" 0 "$ACCESS_LOG"
+
+  echo
+  if [[ "$fail" -eq 0 ]]; then
+    echo "Doctor: all checks passed."
+    return 0
+  fi
+  echo "Doctor: one or more checks failed."
+  return 1
+}
+
+detect_terminal() {
+  if command -v gnome-terminal >/dev/null 2>&1; then
+    echo gnome-terminal
+  elif command -v kgx >/dev/null 2>&1; then
+    echo kgx
+  elif command -v alacritty >/dev/null 2>&1; then
+    echo alacritty
+  elif command -v xterm >/dev/null 2>&1; then
+    echo xterm
+  else
+    echo ""
+  fi
+}
+
+cmd_watch() {
+  # Used by the desktop entry: ensure stack up, then live panel + access tail.
+  ensure_token
+  if [[ "$(unit_state "$HTTP_UNIT")" != active || "$(unit_state "$TUNNEL_UNIT")" != active ]]; then
+    systemctl --user enable --now "$HTTP_UNIT" "$TUNNEL_UNIT" >/dev/null || true
+    sleep 0.6
+  fi
+  touch "$ACCESS_LOG"
+  local self="$REPO_ROOT/scripts/als_map_stack"
+  if [[ -x "$BIN_LINK" ]]; then
+    self="$BIN_LINK"
+  fi
+  clear || true
+  "$self" status || true
+  echo
+  bold "Live access log (Ctrl-C exits watch; units keep running)"
+  echo
+  echo "format: ts ip method path status mcp_method tool"
+  echo "$(dim "$ACCESS_LOG")"
+  echo
+  # Refresh a compact health line every ~15s while tailing via background.
+  (
+    while true; do
+      sleep 15
+      local_raw="$(http_probe "$LOCAL_HEALTH")"
+      pub_raw="$(http_probe "$PUBLIC_HEALTH")"
+      printf '\n[%s] health local=%s public=%s http=%s tunnel=%s\n' \
+        "$(date -u +%H:%M:%SZ)" \
+        "${local_raw%%|*}" \
+        "${pub_raw%%|*}" \
+        "$(unit_state "$HTTP_UNIT")" \
+        "$(unit_state "$TUNNEL_UNIT")"
+    done
+  ) &
+  local hb=$!
+  trap 'kill $hb 2>/dev/null || true' EXIT INT TERM
+  tail -n 20 -F "$ACCESS_LOG"
+}
+
+cmd_install_desktop() {
+  ensure_dirs
+  mkdir -p "$(dirname "$DESKTOP_FILE")" "$(dirname "$ICON_DST")" "$(dirname "$BIN_LINK")"
+
+  if [[ ! -f "$ICON_SRC" ]]; then
+    echo "Missing icon source: $ICON_SRC" >&2
+    exit 1
+  fi
+  install -m 644 "$ICON_SRC" "$ICON_DST"
+
+  # Raster sizes from circular AS logo PNG (sharper than scaling the embedded SVG).
+  if [[ -f "$ICON_PNG_SRC" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - "$ICON_PNG_SRC" "$ICON_THEME_ROOT" "$ICON_NAME" <<'PY'
+import sys
+from pathlib import Path
+from PIL import Image
+src, root, name = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+im = Image.open(src).convert("RGBA")
+for size in (48, 64, 128, 256, 512):
+    dest_dir = root / f"{size}x{size}" / "apps"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    im.resize((size, size), Image.Resampling.LANCZOS).save(dest_dir / f"{name}.png", "PNG", optimize=True)
+PY
+    else
+      mkdir -p "${ICON_THEME_ROOT}/512x512/apps"
+      install -m 644 "$ICON_PNG_SRC" "${ICON_THEME_ROOT}/512x512/apps/${ICON_NAME}.png"
+    fi
+  fi
+
+  ln -sfn "$REPO_ROOT/scripts/als_map_stack" "$BIN_LINK"
+  chmod +x "$REPO_ROOT/scripts/als_map_stack"
+
+  local term
+  term="$(detect_terminal)"
+  local exec_line status_line stop_line doctor_line
+  case "$term" in
+    gnome-terminal)
+      # GLib KeyFile rejects `\ ` in Exec; use quoted titles. Keep `;` inside "…" for actions.
+      exec_line="gnome-terminal --title=\"ALS Map MCP\" -- $BIN_LINK watch"
+      status_line="gnome-terminal --title=\"ALS Map MCP status\" -- bash -c \"$BIN_LINK status; echo; read -r\""
+      stop_line="gnome-terminal --title=\"ALS Map MCP stop\" -- bash -c \"$BIN_LINK stop; echo; read -r\""
+      doctor_line="gnome-terminal --title=\"ALS Map MCP doctor\" -- bash -c \"$BIN_LINK doctor; echo; read -r\""
+      ;;
+    kgx)
+      exec_line="kgx --title=\"ALS Map MCP\" -e $BIN_LINK watch"
+      status_line="kgx --title=\"ALS Map MCP status\" -e bash -c \"$BIN_LINK status; read -r\""
+      stop_line="kgx --title=\"ALS Map MCP stop\" -e bash -c \"$BIN_LINK stop; read -r\""
+      doctor_line="kgx --title=\"ALS Map MCP doctor\" -e bash -c \"$BIN_LINK doctor; read -r\""
+      ;;
+    alacritty)
+      exec_line="alacritty --title \"ALS Map MCP\" -e $BIN_LINK watch"
+      status_line="alacritty --title \"ALS Map MCP status\" -e bash -c \"$BIN_LINK status; read -r\""
+      stop_line="alacritty --title \"ALS Map MCP stop\" -e bash -c \"$BIN_LINK stop; read -r\""
+      doctor_line="alacritty --title \"ALS Map MCP doctor\" -e bash -c \"$BIN_LINK doctor; read -r\""
+      ;;
+    xterm)
+      exec_line="xterm -T \"ALS Map MCP\" -e $BIN_LINK watch"
+      status_line="xterm -T \"ALS Map MCP status\" -e bash -c \"$BIN_LINK status; read -r\""
+      stop_line="xterm -T \"ALS Map MCP stop\" -e bash -c \"$BIN_LINK stop; read -r\""
+      doctor_line="xterm -T \"ALS Map MCP doctor\" -e bash -c \"$BIN_LINK doctor; read -r\""
+      ;;
+    *)
+      # Fallback: let the desktop mark Terminal=true for visibility.
+      exec_line="$BIN_LINK watch"
+      status_line="$BIN_LINK status"
+      stop_line="$BIN_LINK stop"
+      doctor_line="$BIN_LINK doctor"
+      ;;
+  esac
+
+  local terminal_flag=false
+  [[ -z "$term" ]] && terminal_flag=true
+
+  cat >"$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=ALS Map MCP
+GenericName=ALS Map MCP stack
+Comment=Start ALS Map MCP HTTP + Cloudflare tunnel and show live status
+Exec=$exec_line
+TryExec=$BIN_LINK
+Icon=$ICON_NAME
+Terminal=$terminal_flag
+Categories=Development;
+Keywords=als;mcp;tunnel;cloudflare;als map;
+StartupNotify=true
+Actions=Status;Stop;Doctor;
+
+[Desktop Action Status]
+Name=Status panel
+Exec=$status_line
+
+[Desktop Action Stop]
+Name=Stop stack
+Exec=$stop_line
+
+[Desktop Action Doctor]
+Name=Doctor
+Exec=$doctor_line
+EOF
+  chmod +x "$DESKTOP_FILE"
+
+  local desktop_dir desktop_copy
+  desktop_dir="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+  [[ -z "$desktop_dir" ]] && desktop_dir="${HOME}/Desktop"
+  if [[ -d "$desktop_dir" ]]; then
+    desktop_copy="${desktop_dir}/als-map-mcp.desktop"
+    install -m 755 "$DESKTOP_FILE" "$desktop_copy"
+    # ding / GNOME desktop requires trusted + executable for a clickable launcher.
+    if command -v gio >/dev/null 2>&1; then
+      gio set "$desktop_copy" metadata::trusted true >/dev/null 2>&1 || true
+    fi
+  else
+    desktop_copy=""
+  fi
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "${HOME}/.local/share/applications" >/dev/null 2>&1 || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+  fi
+
+  echo "Installed:"
+  echo "  desktop  $DESKTOP_FILE"
+  [[ -n "$desktop_copy" ]] && echo "  Desktop  $desktop_copy"
+  echo "  icon     $ICON_DST"
+  echo "  bin      $BIN_LINK → $REPO_ROOT/scripts/als_map_stack"
+  echo "  terminal $term"
+  echo
+  echo "Find it: Activities → search “ALS Map MCP” (Name=ALS Map MCP)"
+  echo "Or: double-click ~/Desktop/als-map-mcp.desktop · or run: als_map_stack watch"
+  echo "Pin on GNOME: right-click the search hit → Pin to Dash (or drag onto favorites)."
+}
+
+main() {
+  local cmd="${1:-status}"
+  shift || true
+  case "$cmd" in
+    -h|--help|help) usage ;;
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    restart) cmd_restart "$@" ;;
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    watch) cmd_watch "$@" ;;
+    install-desktop|install) cmd_install_desktop "$@" ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
