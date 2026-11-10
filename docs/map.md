@@ -202,6 +202,7 @@ Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in
 | `als_contrast` | Two-slice compare (sources and/or time windows) with deltas on the same metrics |
 | `als_semantic_search` | Local embedding NN search; `query`; filters `source(s)?` / `role?` / `since?` / `until?`; limit ≤50 |
 | `als_thread_features` | Heuristic per-thread features (no LLM); `thread_id?` or filter/list (`source?` / length / refine / critique / density); limit ≤50 |
+| `als_a` … `als_z` | Letter-slot stubs: self-describe purpose + how to interact; **this route does nothing yet** |
 
 Every hit includes cite fields: `id`, `source`, `created_at`, `url`, `thread_id`, `role`.
 
