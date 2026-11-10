@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-stdio MCP server for the Total ALS Map (Phase 1′ + 2′a product surface).
+stdio MCP server for the Total ALS Map (Phase 1′ + 2′a + 2′b product surface).
 
 Tools (hard-capped via als_map_lib):
   als_search, als_get, als_get_many, als_thread, als_browse, als_stats,
-  als_sample, als_style_stats, als_contrast
+  als_sample, als_style_stats, als_contrast, als_semantic_search
 
 Protocol: MCP over JSON-RPC 2.0 on stdin/stdout (Content-Length framing
-compatible with the MCP stdio transport). Stdlib only — no `mcp` package.
+compatible with the MCP stdio transport). Core tools are stdlib-only;
+als_semantic_search needs repo .venv deps (numpy + sentence-transformers).
 
 Cursor MCP config snippet (user settings):
 
   {
     "mcpServers": {
       "als-map": {
-        "command": "python3",
-        "args": ["/ABS/PATH/TO/als_graph/scripts/als_map_mcp.py"],
+        "command": "/home/austen-loren-strine/Development/als_graph/.venv/bin/python",
+        "args": ["/home/austen-loren-strine/Development/als_graph/scripts/als_map_mcp.py"],
         "env": {}
       }
     }
@@ -43,13 +44,14 @@ from als_map_lib import (  # noqa: E402
     open_db,
     sample,
     search,
+    semantic_search,
     stats,
     style_stats,
     thread,
 )
 
 SERVER_NAME = "als-map"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 # Log to stderr only — stdout is the MCP transport.
@@ -258,6 +260,38 @@ TOOL_DEFS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "als_semantic_search",
+        "description": (
+            "Local embedding nearest-neighbor search over the corpus "
+            "(sentence-transformers; no remote embed API). "
+            "Returns cite fields + snippet + cosine score. Hard limit ≤50. "
+            "Use for concept queries that FTS keywords miss."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural-language query"},
+                "sources": {
+                    "type": "string",
+                    "description": "Comma-separated sources, e.g. x_post,x_reply,grok_chat",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Alias of sources; also accepts x|grok shorthand",
+                },
+                "role": {"type": "string", "description": "Filter role (human|assistant|self)"},
+                "since": {"type": "string", "description": "ISO-8601 lower bound (inclusive)"},
+                "until": {"type": "string", "description": "ISO-8601 upper bound (exclusive)"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Snippet char cap (default 400, max 2000)",
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -370,6 +404,17 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                     role=args.get("role"),
                     role_a=args.get("role_a"),
                     role_b=args.get("role_b"),
+                )
+            elif name == "als_semantic_search":
+                payload = semantic_search(
+                    conn,
+                    str(args.get("query") or ""),
+                    sources=args.get("source") or args.get("sources"),
+                    role=args.get("role"),
+                    since=args.get("since"),
+                    until=args.get("until"),
+                    limit=args.get("limit"),
+                    max_chars=args.get("max_chars"),
                 )
             else:
                 return _tool_result({"error": f"unknown tool: {name}"}, is_error=True)

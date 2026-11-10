@@ -3,7 +3,9 @@
 Shared library for the Total ALS Map retrieval substrate.
 
 SQLite + external-content FTS5 over normalized Grok/X JSONL.
-Used by build_map_index.py, map_query.py (debug CLI), and als_map_mcp.py.
+Optional Phase 2′b local embeddings (numpy + sentence-transformers).
+Used by build_map_index.py, build_map_embeddings.py, map_query.py,
+and als_map_mcp.py.
 """
 from __future__ import annotations
 
@@ -26,6 +28,8 @@ DEFAULT_GROK = REPO_ROOT / "data" / "normalized" / "grok.jsonl"
 DEFAULT_X = REPO_ROOT / "data" / "normalized" / "x.jsonl"
 DEFAULT_DB = REPO_ROOT / "data" / "index" / "als_map.sqlite"
 DEFAULT_STATS = REPO_ROOT / "data" / "index" / "als_map-stats.json"
+DEFAULT_EMBEDDINGS = REPO_ROOT / "data" / "index" / "als_map_embeddings.npz"
+DEFAULT_EMBED_META = REPO_ROOT / "data" / "index" / "als_map_embeddings.meta.json"
 
 # Hard caps (efficiency review) — keep agent/Grok token burn bounded.
 MAX_LIMIT = 50
@@ -42,6 +46,15 @@ MAX_RESPONSE_BYTES = 64_000
 DEFAULT_SAMPLE_N = 20
 DEFAULT_OPENING_NGRAM_TOP = 15
 META_SCHEMA_VERSION = 1
+
+# Phase 2′b local embeddings (Raider disk hard limit from docs/embed-disk-budget.md).
+EMBED_SCHEMA_VERSION = 1
+DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBED_DISK_HARD_LIMIT = 74_815_478_169  # floor(0.80 * free) measured 2026-11-09
+EMBED_RAM_GUIDANCE = 28_324_106_240  # floor(0.50 * MemAvailable); not pre-allocated
+DEFAULT_EMBED_BATCH = 64
+_EMBED_INDEX_CACHE: dict[str, Any] = {}
+_EMBED_MODEL_CACHE: dict[str, Any] = {}
 
 CITE_FIELDS = ("id", "source", "created_at", "url", "thread_id", "role")
 
@@ -1281,6 +1294,483 @@ def contrast(
                 "stats": _slim(slice_b),
             },
             "deltas": deltas,
+        }
+    )
+
+
+def _embed_artifact_paths(
+    embeddings_path: Path, meta_path: Path
+) -> list[Path]:
+    paths = [embeddings_path, meta_path]
+    # Atomic write leftovers / temp siblings in the same directory.
+    parent = embeddings_path.parent
+    stem = embeddings_path.name
+    for p in parent.glob(f".{stem}.*"):
+        paths.append(p)
+    for p in parent.glob(f"{meta_path.name}.*"):
+        paths.append(p)
+    # De-dupe while preserving order.
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for p in paths:
+        rp = p.resolve() if p.exists() else p
+        if rp in seen:
+            continue
+        seen.add(rp)
+        out.append(p)
+    return out
+
+
+def embed_index_bytes(embeddings_path: Path, meta_path: Path) -> int:
+    total = 0
+    for p in _embed_artifact_paths(embeddings_path, meta_path):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def assert_embed_disk_budget(
+    *,
+    embeddings_path: Path,
+    meta_path: Path,
+    projected_bytes: int,
+    hard_limit: int = EMBED_DISK_HARD_LIMIT,
+) -> None:
+    """Warn and stop before the vector-index disk hard limit would be exceeded."""
+    current = embed_index_bytes(embeddings_path, meta_path)
+    # Rebuild replaces artifacts; budget against projected final size, not sum.
+    planned = max(int(projected_bytes), 0)
+    if planned > hard_limit:
+        raise RuntimeError(
+            f"refusing embed write: projected index {planned} bytes exceeds "
+            f"disk hard limit {hard_limit} bytes "
+            f"(current artifacts {current} bytes). Warn Austen before raising the cap."
+        )
+
+
+def _embed_fingerprint_payload(
+    fp: InputFingerprint,
+    *,
+    model_name: str,
+    embed_schema_version: int = EMBED_SCHEMA_VERSION,
+) -> dict[str, Any]:
+    return {
+        "inputs": fp.to_dict(),
+        "model": model_name,
+        "embed_schema_version": embed_schema_version,
+        "chunking": "whole_message_truncated_to_model_max",
+        "normalize": "l2",
+    }
+
+
+def _embed_fingerprint_digest(payload: dict[str, Any]) -> str:
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _require_numpy() -> Any:
+    try:
+        import numpy as np  # noqa: WPS433 — optional Phase 2′b dep
+    except ImportError as exc:
+        raise RuntimeError(
+            "numpy is required for semantic search; "
+            "install into repo .venv (see docs/map.md)"
+        ) from exc
+    return np
+
+
+def _require_sentence_transformer(model_name: str) -> Any:
+    if model_name in _EMBED_MODEL_CACHE:
+        return _EMBED_MODEL_CACHE[model_name]
+    try:
+        from sentence_transformers import SentenceTransformer  # noqa: WPS433
+    except ImportError as exc:
+        raise RuntimeError(
+            "sentence-transformers is required for semantic search; "
+            "install into repo .venv (see docs/map.md)"
+        ) from exc
+    model = SentenceTransformer(model_name)
+    _EMBED_MODEL_CACHE[model_name] = model
+    return model
+
+
+def _load_embed_index(embeddings_path: Path, meta_path: Path) -> dict[str, Any]:
+    key = str(embeddings_path.resolve())
+    cached = _EMBED_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    np = _require_numpy()
+    if not embeddings_path.is_file():
+        raise FileNotFoundError(
+            f"embeddings index missing: {embeddings_path} "
+            "(run: python scripts/build_map_embeddings.py)"
+        )
+    data = np.load(embeddings_path, allow_pickle=False)
+    ids = data["ids"]
+    vectors = np.asarray(data["vectors"], dtype=np.float32)
+    meta: dict[str, Any] = {}
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+    packed = {
+        "ids": ids,
+        "vectors": vectors,
+        "id_to_row": {str(i): n for n, i in enumerate(ids.tolist())},
+        "meta": meta,
+        "model": meta.get("model") or DEFAULT_EMBED_MODEL,
+    }
+    _EMBED_INDEX_CACHE[key] = packed
+    return packed
+
+
+def clear_embed_caches() -> None:
+    _EMBED_INDEX_CACHE.clear()
+    _EMBED_MODEL_CACHE.clear()
+
+
+def build_embeddings(
+    *,
+    grok: Path = DEFAULT_GROK,
+    x: Path = DEFAULT_X,
+    db_path: Path = DEFAULT_DB,
+    embeddings_path: Path = DEFAULT_EMBEDDINGS,
+    meta_path: Path = DEFAULT_EMBED_META,
+    model_name: str = DEFAULT_EMBED_MODEL,
+    force: bool = False,
+    batch_size: int = DEFAULT_EMBED_BATCH,
+    progress_every: int = 2000,
+    disk_hard_limit: int = EMBED_DISK_HARD_LIMIT,
+) -> dict[str, Any]:
+    """
+    Embed all records from the FTS sqlite (keyed by id). Fingerprint skip like FTS.
+    Whole-message vectors; long texts truncated to the model max sequence length.
+    """
+    np = _require_numpy()
+    grok = Path(grok)
+    x = Path(x)
+    db_path = Path(db_path)
+    embeddings_path = Path(embeddings_path)
+    meta_path = Path(meta_path)
+    if not db_path.is_file():
+        raise FileNotFoundError(
+            f"FTS index missing: {db_path} (run: python scripts/build_map_index.py)"
+        )
+
+    fp = fingerprint_inputs(grok, x)
+    fp_payload = _embed_fingerprint_payload(fp, model_name=model_name)
+    digest = _embed_fingerprint_digest(fp_payload)
+
+    if (
+        not force
+        and embeddings_path.is_file()
+        and meta_path.is_file()
+    ):
+        try:
+            old = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            old = {}
+        if old.get("digest") == digest:
+            n = int(old.get("records") or 0)
+            return {
+                "skipped": True,
+                "reason": "fingerprint_match",
+                "records": n,
+                "embeddings": str(embeddings_path),
+                "meta": str(meta_path),
+                "fingerprint": fp_payload,
+                "digest": digest,
+                "bytes": embed_index_bytes(embeddings_path, meta_path),
+                "disk_hard_limit": disk_hard_limit,
+            }
+
+    t0 = time.perf_counter()
+    conn = connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT id, text FROM records ORDER BY rowid"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    ids = [str(r["id"]) for r in rows]
+    texts = [r["text"] or "" for r in rows]
+    n = len(ids)
+    if n == 0:
+        raise ValueError("no records to embed")
+
+    # Project float32 matrix + id array (+ json meta headroom).
+    # Dims unknown until model loads; MiniLM-L6-v2 is 384 — use that for budget
+    # pre-check, then re-check with actual dims before write.
+    projected = n * 384 * 4 + n * 64 + 65_536
+    assert_embed_disk_budget(
+        embeddings_path=embeddings_path,
+        meta_path=meta_path,
+        projected_bytes=projected,
+        hard_limit=disk_hard_limit,
+    )
+
+    print(
+        f"loading model {model_name} (local cache / download; no corpus upload)…",
+        file=sys.stderr,
+        flush=True,
+    )
+    model = _require_sentence_transformer(model_name)
+    try:
+        import torch  # noqa: WPS433
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        device = "cpu"
+    if device == "cuda":
+        model = model.to(device)
+
+    if hasattr(model, "get_embedding_dimension"):
+        dims = int(model.get_embedding_dimension())
+    else:
+        dims = int(model.get_sentence_embedding_dimension())
+    projected = n * dims * 4 + n * 64 + 65_536
+    assert_embed_disk_budget(
+        embeddings_path=embeddings_path,
+        meta_path=meta_path,
+        projected_bytes=projected,
+        hard_limit=disk_hard_limit,
+    )
+
+    vectors = np.zeros((n, dims), dtype=np.float32)
+    bs = max(1, int(batch_size))
+    encoded = 0
+    for start in range(0, n, bs):
+        batch = texts[start : start + bs]
+        emb = model.encode(
+            batch,
+            batch_size=len(batch),
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        emb = np.asarray(emb, dtype=np.float32)
+        vectors[start : start + len(batch)] = emb
+        encoded += len(batch)
+        if progress_every and (
+            encoded % progress_every < bs or encoded == n
+        ):
+            elapsed = time.perf_counter() - t0
+            rate = encoded / elapsed if elapsed > 0 else 0.0
+            print(
+                f"embedded {encoded}/{n} ({rate:.1f} rows/s, device={device})",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    embeddings_path.parent.mkdir(parents=True, exist_ok=True)
+    id_arr = np.asarray(ids, dtype=np.str_)
+    # Final size check against serialized estimate.
+    projected_write = int(vectors.nbytes + id_arr.nbytes + 131_072)
+    assert_embed_disk_budget(
+        embeddings_path=embeddings_path,
+        meta_path=meta_path,
+        projected_bytes=projected_write,
+        hard_limit=disk_hard_limit,
+    )
+
+    tmp = embeddings_path.with_name(
+        f".{embeddings_path.name}.{os.getpid()}.tmp.npz"
+    )
+    try:
+        np.savez_compressed(tmp, ids=id_arr, vectors=vectors)
+        tmp.replace(embeddings_path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    elapsed = round(time.perf_counter() - t0, 3)
+    bytes_used = embed_index_bytes(embeddings_path, meta_path)
+    # Meta written after npz so bytes include both once meta exists; recompute after.
+    meta_obj = {
+        "op": "build_embeddings",
+        "model": model_name,
+        "dims": dims,
+        "records": n,
+        "digest": digest,
+        "fingerprint": fp_payload,
+        "chunking": "whole_message_truncated_to_model_max",
+        "normalize": "l2",
+        "device": device,
+        "batch_size": bs,
+        "elapsed_s": elapsed,
+        "embeddings": str(embeddings_path.resolve()),
+        "db": str(db_path.resolve()),
+        "disk_hard_limit": disk_hard_limit,
+        "ram_guidance_bytes": EMBED_RAM_GUIDANCE,
+        "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    meta_path.write_text(
+        json.dumps(meta_obj, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    bytes_used = embed_index_bytes(embeddings_path, meta_path)
+    meta_obj["bytes"] = bytes_used
+    meta_path.write_text(
+        json.dumps(meta_obj, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    clear_embed_caches()
+    return {
+        "skipped": False,
+        **meta_obj,
+        "meta_path": str(meta_path),
+    }
+
+
+def semantic_search(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    sources: str | Sequence[str] | None = None,
+    role: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int | None = None,
+    max_chars: int | None = None,
+    embeddings_path: Path = DEFAULT_EMBEDDINGS,
+    meta_path: Path = DEFAULT_EMBED_META,
+) -> dict[str, Any]:
+    """Local embedding nearest-neighbor search; cite + snippet like FTS search."""
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query is required")
+    lim = _clamp_limit(limit, DEFAULT_SEARCH_LIMIT)
+    snippet_chars = _clamp_chars(max_chars, DEFAULT_SNIPPET_CHARS, MAX_SNIPPET_CHARS)
+    np = _require_numpy()
+
+    index = _load_embed_index(Path(embeddings_path), Path(meta_path))
+    model_name = str(index.get("model") or DEFAULT_EMBED_MODEL)
+    model = _require_sentence_transformer(model_name)
+    q_vec = model.encode(
+        [q],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+    q_vec = np.asarray(q_vec, dtype=np.float32).reshape(-1)
+
+    vectors = index["vectors"]
+    ids = index["ids"]
+    if vectors.shape[0] == 0:
+        return _fit_response(
+            {
+                "op": "semantic_search",
+                "query": q,
+                "limit": lim,
+                "returned": 0,
+                "model": model_name,
+                "hits": [],
+            }
+        )
+
+    where_sql, params = _filter_where(
+        sources=sources, role=role, since=since, until=until
+    )
+    # If any filter is active, restrict to matching ids.
+    filter_active = bool(
+        _parse_sources(sources) is not None
+        or role is not None
+        or since
+        or until
+    )
+    candidate_rows: np.ndarray | None = None
+    if filter_active:
+        allowed = {
+            str(r["id"])
+            for r in conn.execute(
+                f"SELECT id FROM records WHERE {where_sql}", params
+            )
+        }
+        if not allowed:
+            return _fit_response(
+                {
+                    "op": "semantic_search",
+                    "query": q,
+                    "limit": lim,
+                    "returned": 0,
+                    "model": model_name,
+                    "hits": [],
+                }
+            )
+        id_to_row = index["id_to_row"]
+        rows_list = [id_to_row[i] for i in allowed if i in id_to_row]
+        if not rows_list:
+            return _fit_response(
+                {
+                    "op": "semantic_search",
+                    "query": q,
+                    "limit": lim,
+                    "returned": 0,
+                    "model": model_name,
+                    "hits": [],
+                }
+            )
+        candidate_rows = np.asarray(rows_list, dtype=np.int64)
+        scores = vectors[candidate_rows] @ q_vec
+        top_n = min(lim, scores.shape[0])
+        if top_n <= 0:
+            pick_local = np.asarray([], dtype=np.int64)
+        elif top_n == scores.shape[0]:
+            pick_local = np.argsort(-scores)
+        else:
+            part = np.argpartition(-scores, top_n - 1)[:top_n]
+            pick_local = part[np.argsort(-scores[part])]
+        pick = candidate_rows[pick_local]
+        pick_scores = scores[pick_local]
+    else:
+        scores = vectors @ q_vec
+        top_n = min(lim, scores.shape[0])
+        if top_n == scores.shape[0]:
+            pick = np.argsort(-scores)
+        else:
+            part = np.argpartition(-scores, top_n - 1)[:top_n]
+            pick = part[np.argsort(-scores[part])]
+        pick_scores = scores[pick]
+
+    hit_ids = [str(ids[int(i)]) for i in pick]
+    placeholders = ",".join("?" * len(hit_ids)) if hit_ids else ""
+    by_id: dict[str, sqlite3.Row] = {}
+    if hit_ids:
+        for row in conn.execute(
+            f"""
+            SELECT id, source, created_at, url, thread_id, role, text
+            FROM records WHERE id IN ({placeholders})
+            """,
+            hit_ids,
+        ):
+            by_id[str(row["id"])] = row
+
+    hits: list[dict[str, Any]] = []
+    for rid, score in zip(hit_ids, pick_scores.tolist()):
+        row = by_id.get(rid)
+        if row is None:
+            continue
+        item = _row_cite(row)
+        item["score"] = round(float(score), 6)
+        snip, _ = _truncate(row["text"] or "", snippet_chars)
+        item["snippet"] = snip
+        hits.append(item)
+
+    return _fit_response(
+        {
+            "op": "semantic_search",
+            "query": q,
+            "limit": lim,
+            "returned": len(hits),
+            "model": model_name,
+            "hits": hits,
         }
     )
 

@@ -1,15 +1,15 @@
-# Total ALS Map (Phase 1′ + 2′a)
+# Total ALS Map (Phase 1′ + 2′a + 2′b)
 
-Queryable personal corpus: **X posts/replies/reposts/likes/notes + every Grok turn** from the normalized JSONL, indexed in local SQLite FTS5 for **retrieval-backed analysis by Grok** (via Cursor MCP tools).
+Queryable personal corpus: **X posts/replies/reposts/likes/notes + every Grok turn** from the normalized JSONL, indexed in local SQLite FTS5 (+ optional local embeddings) for **retrieval-backed analysis by Grok** (via Cursor MCP tools).
 
-This is a **retrieval map substrate**, not a UI/graph/embeddings product. Phase **2′a** adds prior-free sample / style / contrast tools (still no embeddings).
+This is a **retrieval map substrate**, not a UI/graph product. Phase **2′a** adds prior-free sample / style / contrast. Phase **2′b** adds **local-only** semantic search (no corpus upload / no remote embed API).
 
 ## Corpus boundary (Total v1)
 
 | In | Out |
 |----|-----|
 | Normalized `grok.jsonl` + `x.jsonl` | DMs, media blobs, live X/Grok API sync |
-| Agent tools over the index | Marketing UI, embeddings, opinion graph |
+| Agent tools over the index | Marketing UI, opinion graph, cloud-hosted vectors |
 
 ## Build the index
 
@@ -30,6 +30,32 @@ Rebuild is skipped when the input fingerprint (paths + sizes + mtimes + schema v
 
 Expected: ~48,334 rows; build well under a minute on this machine.
 
+## Build the embedding index (Phase 2′b)
+
+Local sentence-transformers on Raider (CUDA when available). **No remote embed API; corpus stays on disk.**
+
+| Setting | Value |
+|---------|-------|
+| Model | `sentence-transformers/all-MiniLM-L6-v2` (384-d) |
+| Chunking | whole message; truncated to model max sequence length |
+| Index paths | `data/index/als_map_embeddings.npz` + `als_map_embeddings.meta.json` |
+| Disk hard limit | **74815478169** bytes for vector-index artifacts (warn + refuse before exceed; do not pre-claim) |
+| RAM guidance | ~28324106240 bytes working-set guidance (not pre-allocated) |
+
+Prereq: FTS index built; repo `.venv` with embed deps:
+
+```bash
+uv venv .venv --python python3.12
+uv pip install --python .venv/bin/python -r requirements-embed.txt
+# optional CUDA torch:
+# uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cu124
+
+.venv/bin/python scripts/build_map_embeddings.py
+.venv/bin/python scripts/build_map_embeddings.py --force
+```
+
+Fingerprint skip (inputs + model + embed schema) mirrors FTS. Soft timebox: escalate if model download/build exceeds ~90 minutes.
+
 ## Debug CLI (not the product)
 
 ```bash
@@ -48,7 +74,8 @@ Search defaults to **cite fields + snippet**. Pass `--full` for truncated body t
 Stdio MCP, stdlib JSON-RPC (no `mcp` PyPI package required):
 
 ```bash
-python scripts/als_map_mcp.py
+# Prefer repo .venv so als_semantic_search can load the local model
+.venv/bin/python scripts/als_map_mcp.py
 ```
 
 Optional: `ALS_MAP_DB=/path/to/als_map.sqlite`.
@@ -61,9 +88,9 @@ Add to Cursor MCP settings (path may vary by machine):
 {
   "mcpServers": {
     "als-map": {
-      "command": "python3",
+      "command": "/home/austen-loren-strine/Development/als_graph/.venv/bin/python",
       "args": [
-        "/ABS/PATH/TO/als_graph/scripts/als_map_mcp.py"
+        "/home/austen-loren-strine/Development/als_graph/scripts/als_map_mcp.py"
       ]
     }
   }
@@ -162,6 +189,7 @@ Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in
 | `als_sample` | Prior-free random sample; `n`≤50; `role?` / `source?` (`x`\|`grok` or specific); `stratify_by` `none`\|`time`\|`thread_length`; `seed?` |
 | `als_style_stats` | Deterministic style aggregates for a slice (`source?` / `role?` / `since?` / `until?`) |
 | `als_contrast` | Two-slice compare (sources and/or time windows) with deltas on the same metrics |
+| `als_semantic_search` | Local embedding NN search; `query`; filters `source(s)?` / `role?` / `since?` / `until?`; limit ≤50 |
 
 Every hit includes cite fields: `id`, `source`, `created_at`, `url`, `thread_id`, `role`.
 
@@ -180,12 +208,16 @@ Primary ongoing cost is **agent/Grok context tokens**, not index CPU.
 
 | Path | Purpose |
 |------|---------|
-| `scripts/als_map_lib.py` | Shared build + query library |
+| `scripts/als_map_lib.py` | Shared build + query library (FTS + embeddings) |
 | `scripts/build_map_index.py` | JSONL → sqlite |
+| `scripts/build_map_embeddings.py` | sqlite → local embedding `.npz` |
 | `scripts/map_query.py` | Debug CLI |
 | `scripts/als_map_mcp.py` | Stdio MCP server |
 | `scripts/als_map_mcp_http.py` | Streamable HTTP MCP + Bearer auth |
 | `scripts/als_map_stack` | One-command start/stop/status/logs/doctor + desktop launcher |
+| `requirements-embed.txt` | Optional Phase 2′b venv deps |
 | `assets/als-map-mcp.svg` | Desktop icon for ALS Map MCP |
 | `docs/cloudflare-tunnel.example.yml` | Tunnel stub (DNS not ready) |
-| `data/index/` | Generated index (gitignored) |
+| `docs/embed-disk-budget.md` | Raider vector-index disk/RAM caps |
+| `data/index/` | Generated FTS + embedding index (gitignored) |
+| `.venv/` | Local Python env for embed + MCP HTTP (gitignored) |
