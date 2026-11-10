@@ -1,0 +1,8 @@
+# Phase 2′b local semantic search (install into repo .venv; do not use system pip)
+#   uv venv .venv --python python3.12
+#   uv pip install --python .venv/bin/python -r requirements-embed.txt
+# Optional CUDA torch wheel index:
+#   uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cu124
+numpy>=2.0
+sentence-transformers>=3.0
+torch>=2.2

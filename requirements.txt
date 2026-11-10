@@ -1,1 +1,3 @@
 ijson>=3.2.3
+
+# Phase 2′b embeddings: see requirements-embed.txt + docs/map.md (.venv)
