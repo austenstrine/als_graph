@@ -1,8 +1,8 @@
-# Total ALS Map (Phase 1′)
+# Total ALS Map (Phase 1′ + 2′a)
 
 Queryable personal corpus: **X posts/replies/reposts/likes/notes + every Grok turn** from the normalized JSONL, indexed in local SQLite FTS5 for **retrieval-backed analysis by Grok** (via Cursor MCP tools).
 
-This is a **retrieval map substrate**, not a UI/graph/embeddings product.
+This is a **retrieval map substrate**, not a UI/graph/embeddings product. Phase **2′a** adds prior-free sample / style / contrast tools (still no embeddings).
 
 ## Corpus boundary (Total v1)
 
@@ -159,6 +159,9 @@ Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in
 | `als_thread` | Ordered turns for `thread_id` (default window ≤30) |
 | `als_browse` | Keywordless chronological window |
 | `als_stats` | Counts; breakdown `source` \| `role` \| `month` \| `both` |
+| `als_sample` | Prior-free random sample; `n`≤50; `role?` / `source?` (`x`\|`grok` or specific); `stratify_by` `none`\|`time`\|`thread_length`; `seed?` |
+| `als_style_stats` | Deterministic style aggregates for a slice (`source?` / `role?` / `since?` / `until?`) |
+| `als_contrast` | Two-slice compare (sources and/or time windows) with deltas on the same metrics |
 
 Every hit includes cite fields: `id`, `source`, `created_at`, `url`, `thread_id`, `role`.
 

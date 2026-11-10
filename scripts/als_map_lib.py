@@ -10,9 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
+import re
 import sqlite3
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,9 +39,61 @@ MAX_SNIPPET_CHARS = 2000
 DEFAULT_FULL_CHARS = 32_000
 MAX_FULL_CHARS = 64_000
 MAX_RESPONSE_BYTES = 64_000
+DEFAULT_SAMPLE_N = 20
+DEFAULT_OPENING_NGRAM_TOP = 15
 META_SCHEMA_VERSION = 1
 
 CITE_FIELDS = ("id", "source", "created_at", "url", "thread_id", "role")
+
+# Shorthand source groups for Phase 2′a discovery tools.
+SOURCE_ALIASES: dict[str, tuple[str, ...]] = {
+    "x": ("x_post", "x_reply", "x_repost", "x_like", "x_note"),
+    "grok": ("grok_chat",),
+}
+
+# Crude register heuristics — approximate only; documented as such in tool output.
+_CONTRACTION_RE = re.compile(r"\b\w+'\w+\b", re.UNICODE)
+_WORD_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)?", re.UNICODE)
+_IMPERATIVE_VERBS = frozenset(
+    {
+        "add",
+        "check",
+        "close",
+        "create",
+        "delete",
+        "do",
+        "explain",
+        "find",
+        "fix",
+        "get",
+        "give",
+        "help",
+        "list",
+        "look",
+        "make",
+        "open",
+        "please",
+        "remove",
+        "run",
+        "search",
+        "send",
+        "set",
+        "show",
+        "start",
+        "stop",
+        "tell",
+        "try",
+        "update",
+        "use",
+        "write",
+    }
+)
+_THREAD_LENGTH_BUCKETS: tuple[tuple[str, int, int | None], ...] = (
+    ("1", 1, 1),
+    ("2-5", 2, 5),
+    ("6-20", 6, 20),
+    ("21+", 21, None),
+)
 
 
 @dataclass(frozen=True)
@@ -361,7 +416,82 @@ def _parse_sources(sources: str | Sequence[str] | None) -> list[str] | None:
         parts = [p.strip() for p in sources.split(",") if p.strip()]
     else:
         parts = [str(p).strip() for p in sources if str(p).strip()]
-    return parts or None
+    if not parts:
+        return None
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        key = part.lower()
+        aliases = SOURCE_ALIASES.get(key)
+        values = aliases if aliases is not None else (part,)
+        for value in values:
+            if value not in seen:
+                seen.add(value)
+                expanded.append(value)
+    return expanded or None
+
+
+def _filter_where(
+    *,
+    sources: str | Sequence[str] | None = None,
+    role: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    table_alias: str = "",
+) -> tuple[str, list[Any]]:
+    """Shared WHERE builder for browse / sample / style filters."""
+    prefix = f"{table_alias}." if table_alias else ""
+    where = ["1=1"]
+    params: list[Any] = []
+    srcs = _parse_sources(sources)
+    if srcs:
+        where.append(f"{prefix}source IN ({','.join('?' * len(srcs))})")
+        params.extend(srcs)
+    if role is not None:
+        where.append(f"{prefix}role IS ?" if role == "" else f"{prefix}role = ?")
+        params.append(None if role == "" else role)
+    if since:
+        where.append(f"{prefix}created_at IS NOT NULL AND {prefix}created_at >= ?")
+        params.append(since)
+    if until:
+        where.append(f"{prefix}created_at IS NOT NULL AND {prefix}created_at < ?")
+        params.append(until)
+    return " AND ".join(where), params
+
+
+def _median(sorted_vals: Sequence[float]) -> float | None:
+    n = len(sorted_vals)
+    if n == 0:
+        return None
+    mid = n // 2
+    if n % 2:
+        return float(sorted_vals[mid])
+    return (float(sorted_vals[mid - 1]) + float(sorted_vals[mid])) / 2.0
+
+
+def _mean(vals: Sequence[float]) -> float | None:
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def _tokenize(text: str) -> list[str]:
+    return [m.group(0).lower() for m in _WORD_RE.finditer(text or "")]
+
+
+def _thread_length_bucket(n: int) -> str:
+    for label, lo, hi in _THREAD_LENGTH_BUCKETS:
+        if n < lo:
+            continue
+        if hi is None or n <= hi:
+            return label
+    return "21+"
+
+
+def _opening_ngrams(tokens: Sequence[str], n: int) -> str | None:
+    if len(tokens) < n:
+        return None
+    return " ".join(tokens[:n])
 
 
 def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
@@ -785,6 +915,374 @@ def stats(
         out["by_source"] = {r["source"]: int(r["n"]) for r in rows}
 
     return _fit_response(out)
+
+
+def sample(
+    conn: sqlite3.Connection,
+    *,
+    n: int | None = None,
+    role: str | None = None,
+    source: str | Sequence[str] | None = None,
+    sources: str | Sequence[str] | None = None,
+    stratify_by: str | None = "none",
+    seed: int | None = None,
+    max_chars: int | None = None,
+) -> dict[str, Any]:
+    """Prior-free stratified random sample (snippet-shaped like search)."""
+    lim = _clamp_limit(n, DEFAULT_SAMPLE_N)
+    strat = (stratify_by or "none").strip().lower()
+    if strat not in {"none", "time", "thread_length"}:
+        raise ValueError("stratify_by must be none|time|thread_length")
+    max_c = _clamp_chars(max_chars, DEFAULT_SNIPPET_CHARS, MAX_SNIPPET_CHARS)
+    src_arg = source if source is not None else sources
+    where_sql, params = _filter_where(sources=src_arg, role=role)
+
+    rows = conn.execute(
+        f"""
+        SELECT id, source, created_at, url, thread_id, role, text
+        FROM records
+        WHERE {where_sql}
+        """,
+        params,
+    ).fetchall()
+    total = len(rows)
+    rng = random.Random(seed)
+
+    selected: list[sqlite3.Row] = []
+    buckets_meta: dict[str, Any] = {}
+
+    if total == 0 or lim == 0:
+        selected = []
+    elif strat == "none":
+        selected = rng.sample(list(rows), k=min(lim, total))
+        buckets_meta = {"none": {"eligible": total, "picked": len(selected)}}
+    else:
+        groups: dict[str, list[sqlite3.Row]] = {}
+        if strat == "time":
+            for row in rows:
+                created = row["created_at"]
+                if isinstance(created, str) and len(created) >= 7:
+                    key = created[:7]
+                else:
+                    key = "unknown"
+                groups.setdefault(key, []).append(row)
+        else:  # thread_length
+            length_rows = conn.execute(
+                f"""
+                SELECT r.thread_id AS thread_id, COUNT(*) AS n
+                FROM records r
+                WHERE r.thread_id IN (
+                    SELECT DISTINCT thread_id FROM records WHERE {where_sql}
+                )
+                GROUP BY r.thread_id
+                """,
+                params,
+            ).fetchall()
+            lengths = {r["thread_id"]: int(r["n"]) for r in length_rows}
+            for row in rows:
+                key = _thread_length_bucket(lengths.get(row["thread_id"], 1))
+                groups.setdefault(key, []).append(row)
+
+        keys = sorted(groups.keys())
+        if not keys:
+            selected = []
+        else:
+            # Equal quotas across non-empty buckets; leftover goes round-robin.
+            base = lim // len(keys)
+            rem = lim % len(keys)
+            quota = {k: base + (1 if i < rem else 0) for i, k in enumerate(keys)}
+            leftover_pool: list[sqlite3.Row] = []
+            for key in keys:
+                pool = list(groups[key])
+                rng.shuffle(pool)
+                take = min(quota[key], len(pool))
+                picked = pool[:take]
+                selected.extend(picked)
+                leftover_pool.extend(pool[take:])
+                buckets_meta[key] = {
+                    "eligible": len(groups[key]),
+                    "quota": quota[key],
+                    "picked": take,
+                }
+            need = lim - len(selected)
+            if need > 0 and leftover_pool:
+                rng.shuffle(leftover_pool)
+                extra = leftover_pool[:need]
+                selected.extend(extra)
+                buckets_meta["_fill"] = {"picked": len(extra)}
+
+    # Stable order within response: by created_at then id (sample already chosen).
+    selected.sort(
+        key=lambda r: (
+            1 if r["created_at"] is None else 0,
+            r["created_at"] or "",
+            r["id"],
+        )
+    )
+
+    hits: list[dict[str, Any]] = []
+    for row in selected:
+        item = _row_cite(row)
+        text, trunc = _truncate(row["text"] or "", max_c)
+        item["snippet"] = text
+        item["text_truncated"] = trunc
+        hits.append(item)
+
+    return _fit_response(
+        {
+            "op": "sample",
+            "n": lim,
+            "role": role,
+            "source": src_arg,
+            "stratify_by": strat,
+            "seed": seed,
+            "eligible": total,
+            "returned": len(hits),
+            "buckets": buckets_meta,
+            "hits": hits,
+        }
+    )
+
+
+def style_stats(
+    conn: sqlite3.Connection,
+    *,
+    source: str | Sequence[str] | None = None,
+    sources: str | Sequence[str] | None = None,
+    role: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    opening_ngrams_top: int = DEFAULT_OPENING_NGRAM_TOP,
+    opening_role: str | None = None,
+) -> dict[str, Any]:
+    """Cheap deterministic style aggregates (no full-text dump)."""
+    src_arg = source if source is not None else sources
+    where_sql, params = _filter_where(
+        sources=src_arg, role=role, since=since, until=until
+    )
+    top_n = max(0, min(int(opening_ngrams_top), 50))
+    # Default: opening n-grams from human turns; if caller already filters a
+    # role (e.g. X `self`), use that slice instead of empty n-grams.
+    ngram_role = opening_role if opening_role is not None else (role if role else "human")
+
+    # First message per thread (full corpus) — pure Python to avoid window-fn
+    # crashes seen with this SQLite build over the FTS-backed DB.
+    best_key: dict[str, tuple[int, str, str]] = {}
+    for tid, rid, created in conn.execute(
+        "SELECT thread_id, id, created_at FROM records"
+    ):
+        key = (1 if created is None else 0, created or "", rid)
+        prev = best_key.get(tid)
+        if prev is None or key < prev:
+            best_key[tid] = key
+    first_ids = {key[2] for key in best_key.values()}
+
+    rows = conn.execute(
+        f"""
+        SELECT id, source, role, thread_id, text
+        FROM records
+        WHERE {where_sql}
+        """,
+        params,
+    ).fetchall()
+
+    count = len(rows)
+    char_lens: list[float] = []
+    word_lens: list[float] = []
+    qmark_chars = 0
+    total_chars = 0
+    followups = 0
+    contractions = 0
+    total_words = 0
+    imperative_hits = 0
+    bigrams: Counter[str] = Counter()
+    trigrams: Counter[str] = Counter()
+    ngram_docs = 0
+
+    for row in rows:
+        text = row["text"] or ""
+        char_lens.append(float(len(text)))
+        tokens = _tokenize(text)
+        word_lens.append(float(len(tokens)))
+        total_chars += len(text)
+        qmark_chars += text.count("?")
+        if row["id"] not in first_ids:
+            followups += 1
+        total_words += len(tokens)
+        contractions += len(_CONTRACTION_RE.findall(text))
+        if tokens and tokens[0] in _IMPERATIVE_VERBS:
+            imperative_hits += 1
+
+        use_ngrams = ngram_role is None or (row["role"] == ngram_role)
+        if use_ngrams:
+            ngram_docs += 1
+            bg = _opening_ngrams(tokens, 2)
+            tg = _opening_ngrams(tokens, 3)
+            if bg:
+                bigrams[bg] += 1
+            if tg:
+                trigrams[tg] += 1
+
+    char_sorted = sorted(char_lens)
+    word_sorted = sorted(word_lens)
+
+    def _top(counter: Counter[str]) -> list[dict[str, Any]]:
+        return [{"ngram": k, "count": int(v)} for k, v in counter.most_common(top_n)]
+
+    out: dict[str, Any] = {
+        "op": "style_stats",
+        "filters": {
+            "source": src_arg,
+            "role": role,
+            "since": since,
+            "until": until,
+        },
+        "count": count,
+        "char_length": {
+            "mean": None if count == 0 else round(_mean(char_lens) or 0.0, 3),
+            "median": None if count == 0 else _median(char_sorted),
+        },
+        "word_length": {
+            "mean": None if count == 0 else round(_mean(word_lens) or 0.0, 3),
+            "median": None if count == 0 else _median(word_sorted),
+        },
+        "question_mark_density": (
+            None if total_chars == 0 else round(qmark_chars / total_chars, 6)
+        ),
+        "followup_share": None if count == 0 else round(followups / count, 6),
+        "opening_ngrams": {
+            "role": ngram_role,
+            "docs": ngram_docs,
+            "top_bigrams": _top(bigrams),
+            "top_trigrams": _top(trigrams),
+            "note": (
+                "Opening n-grams default to human-role messages; when a role "
+                "filter is set, n-grams use that role instead."
+            ),
+        },
+        "register_approx": {
+            "contraction_rate": (
+                None if total_words == 0 else round(contractions / total_words, 6)
+            ),
+            "imperative_open_share": (
+                None if count == 0 else round(imperative_hits / count, 6)
+            ),
+            "note": (
+                "Approximate heuristics only (contraction regex + crude imperative "
+                "verb list on first token)."
+            ),
+        },
+    }
+    return _fit_response(out)
+
+
+def contrast(
+    conn: sqlite3.Connection,
+    *,
+    source_a: str | Sequence[str] | None = None,
+    source_b: str | Sequence[str] | None = None,
+    since_a: str | None = None,
+    until_a: str | None = None,
+    since_b: str | None = None,
+    until_b: str | None = None,
+    role: str | None = None,
+    role_a: str | None = None,
+    role_b: str | None = None,
+) -> dict[str, Any]:
+    """Compare two slices on the same metrics as style_stats, with deltas."""
+    ra = role_a if role_a is not None else role
+    rb = role_b if role_b is not None else role
+    if (
+        source_a is None
+        and source_b is None
+        and since_a is None
+        and until_a is None
+        and since_b is None
+        and until_b is None
+        and ra is None
+        and rb is None
+    ):
+        raise ValueError(
+            "contrast needs at least one differing slice "
+            "(source_a/source_b and/or time windows)"
+        )
+
+    slice_a = style_stats(
+        conn, source=source_a, role=ra, since=since_a, until=until_a
+    )
+    slice_b = style_stats(
+        conn, source=source_b, role=rb, since=since_b, until=until_b
+    )
+
+    def _num(path: Sequence[str], payload: dict[str, Any]) -> float | None:
+        cur: Any = payload
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                return None
+            cur = cur[key]
+        if cur is None:
+            return None
+        try:
+            return float(cur)
+        except (TypeError, ValueError):
+            return None
+
+    metric_paths: list[tuple[str, tuple[str, ...]]] = [
+        ("count", ("count",)),
+        ("char_length_mean", ("char_length", "mean")),
+        ("char_length_median", ("char_length", "median")),
+        ("word_length_mean", ("word_length", "mean")),
+        ("word_length_median", ("word_length", "median")),
+        ("question_mark_density", ("question_mark_density",)),
+        ("followup_share", ("followup_share",)),
+        ("contraction_rate", ("register_approx", "contraction_rate")),
+        ("imperative_open_share", ("register_approx", "imperative_open_share")),
+    ]
+    deltas: dict[str, Any] = {}
+    for name, path in metric_paths:
+        a = _num(path, slice_a)
+        b = _num(path, slice_b)
+        if a is None and b is None:
+            deltas[name] = {"a": None, "b": None, "delta_b_minus_a": None}
+        else:
+            aa = 0.0 if a is None else a
+            bb = 0.0 if b is None else b
+            deltas[name] = {
+                "a": a,
+                "b": b,
+                "delta_b_minus_a": None if (a is None or b is None) else round(bb - aa, 6),
+            }
+
+    # Drop heavy n-gram lists from nested copies; keep counts only.
+    def _slim(stats_payload: dict[str, Any]) -> dict[str, Any]:
+        slim = dict(stats_payload)
+        slim.pop("truncated_response", None)
+        ong = dict(slim.get("opening_ngrams") or {})
+        ong["top_bigrams"] = (ong.get("top_bigrams") or [])[:5]
+        ong["top_trigrams"] = (ong.get("top_trigrams") or [])[:5]
+        slim["opening_ngrams"] = ong
+        return slim
+
+    return _fit_response(
+        {
+            "op": "contrast",
+            "slice_a": {
+                "source": source_a,
+                "role": ra,
+                "since": since_a,
+                "until": until_a,
+                "stats": _slim(slice_a),
+            },
+            "slice_b": {
+                "source": source_b,
+                "role": rb,
+                "since": since_b,
+                "until": until_b,
+                "stats": _slim(slice_b),
+            },
+            "deltas": deltas,
+        }
+    )
 
 
 def open_db(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:

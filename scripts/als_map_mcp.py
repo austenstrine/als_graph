@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-stdio MCP server for the Total ALS Map (Phase 1′ product surface).
+stdio MCP server for the Total ALS Map (Phase 1′ + 2′a product surface).
 
 Tools (hard-capped via als_map_lib):
-  als_search, als_get, als_get_many, als_thread, als_browse, als_stats
+  als_search, als_get, als_get_many, als_thread, als_browse, als_stats,
+  als_sample, als_style_stats, als_contrast
 
 Protocol: MCP over JSON-RPC 2.0 on stdin/stdout (Content-Length framing
 compatible with the MCP stdio transport). Stdlib only — no `mcp` package.
@@ -36,16 +37,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from als_map_lib import (  # noqa: E402
     DEFAULT_DB,
     browse,
+    contrast,
     get_many,
     get_one,
     open_db,
+    sample,
     search,
     stats,
+    style_stats,
     thread,
 )
 
 SERVER_NAME = "als-map"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 # Log to stderr only — stdout is the MCP transport.
@@ -177,6 +181,83 @@ TOOL_DEFS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "als_sample",
+        "description": (
+            "Prior-free random sample of records (snippet-shaped like als_search). "
+            "Optional stratification by time (year-month) or thread_length. "
+            "source accepts x|grok shorthand or specific source names. n≤50."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                "role": {"type": "string", "description": "Filter role (human|assistant|self)"},
+                "source": {
+                    "type": "string",
+                    "description": "x|grok shorthand, or comma-separated sources",
+                },
+                "stratify_by": {
+                    "type": "string",
+                    "enum": ["none", "time", "thread_length"],
+                    "default": "none",
+                },
+                "seed": {
+                    "type": "integer",
+                    "description": "RNG seed for reproducible samples",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Snippet char cap (default 400, max 2000)",
+                },
+            },
+        },
+    },
+    {
+        "name": "als_style_stats",
+        "description": (
+            "Cheap deterministic style aggregates for a filtered slice: count, "
+            "mean/median char & word length, question-mark density, follow-up share, "
+            "opening bigrams/trigrams (human role by default), approximate register markers. "
+            "No full-text dump."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "x|grok shorthand, or comma-separated sources",
+                },
+                "role": {"type": "string"},
+                "since": {"type": "string", "description": "ISO-8601 lower bound (inclusive)"},
+                "until": {"type": "string", "description": "ISO-8601 upper bound (exclusive)"},
+            },
+        },
+    },
+    {
+        "name": "als_contrast",
+        "description": (
+            "Compare two slices (source_a vs source_b and/or time windows) on the same "
+            "metrics as als_style_stats, with delta_b_minus_a columns."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_a": {"type": "string"},
+                "source_b": {"type": "string"},
+                "since_a": {"type": "string"},
+                "until_a": {"type": "string"},
+                "since_b": {"type": "string"},
+                "until_b": {"type": "string"},
+                "role": {
+                    "type": "string",
+                    "description": "Shared role filter for both slices",
+                },
+                "role_a": {"type": "string"},
+                "role_b": {"type": "string"},
+            },
+        },
+    },
 ]
 
 
@@ -258,6 +339,38 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                 )
             elif name == "als_stats":
                 payload = stats(conn, breakdown=args.get("breakdown") or "source")
+            elif name == "als_sample":
+                seed = args.get("seed")
+                payload = sample(
+                    conn,
+                    n=args.get("n"),
+                    role=args.get("role"),
+                    source=args.get("source") or args.get("sources"),
+                    stratify_by=args.get("stratify_by") or "none",
+                    seed=None if seed is None else int(seed),
+                    max_chars=args.get("max_chars"),
+                )
+            elif name == "als_style_stats":
+                payload = style_stats(
+                    conn,
+                    source=args.get("source") or args.get("sources"),
+                    role=args.get("role"),
+                    since=args.get("since"),
+                    until=args.get("until"),
+                )
+            elif name == "als_contrast":
+                payload = contrast(
+                    conn,
+                    source_a=args.get("source_a"),
+                    source_b=args.get("source_b"),
+                    since_a=args.get("since_a"),
+                    until_a=args.get("until_a"),
+                    since_b=args.get("since_b"),
+                    until_b=args.get("until_b"),
+                    role=args.get("role"),
+                    role_a=args.get("role_a"),
+                    role_b=args.get("role_b"),
+                )
             else:
                 return _tool_result({"error": f"unknown tool: {name}"}, is_error=True)
         return _tool_result(payload)
