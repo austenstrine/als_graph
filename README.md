@@ -64,8 +64,13 @@ Cursor MCP snippet (stdio):
 | `scripts/map_query.py` | Debug CLI (not the product) |
 | `scripts/als_map_mcp.py` | Stdio MCP: search / get / thread / browse / stats |
 | `scripts/als_map_mcp_http.py` | Streamable HTTP MCP + Bearer auth |
+| `scripts/als_map_stack` | HTTP MCP + tunnel control plane |
+| `scripts/als_map_isolate` | Smoke/tests under systemd --user cgroup scope |
+| `scripts/als_map_systemd.sh` | Safe `systemctl --user` helpers (fail soft; never kill) |
+| `systemd/user/` | Slice + MCP unit templates (`MemoryMax`/`TasksMax`; no `CPUQuota`) |
 | `docs/normalization.md` | Schema + how to re-run normalizers |
 | `docs/map.md` | Map index, caps, MCP how-to (stdio + remote) |
+| `docs/als-map-stack.md` | Stack launcher + process isolation |
 | `docs/cloudflare-tunnel.example.yml` | Cloudflare Tunnel stub (hostname future) |
 | `data/normalized/` | Generated JSONL (gitignored) |
 | `data/index/` | Generated sqlite index (gitignored) |

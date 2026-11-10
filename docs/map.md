@@ -168,9 +168,10 @@ One command for HTTP MCP + Cloudflare tunnel (systemd user units), status panel,
 ```bash
 scripts/als_map_stack start          # or: status | stop | restart | probe | logs -f | doctor | watch
 scripts/als_map_stack install-desktop
+scripts/als_map_isolate run -- …     # smoke under MemoryMax/TasksMax scope (no CPUQuota)
 ```
 
-Details: [`docs/als-map-stack.md`](als-map-stack.md). Access log: `~/.local/state/als_map/access.log` (no bearer values). Token: `~/.config/als_map/mcp_token`.
+Details: [`docs/als-map-stack.md`](als-map-stack.md) (stack + cgroup isolation). Access log: `~/.local/state/als_map/access.log` (no bearer values). Token: `~/.config/als_map/mcp_token`.
 
 ### Cloudflare Tunnel
 

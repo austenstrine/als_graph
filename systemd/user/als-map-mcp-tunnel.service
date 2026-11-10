@@ -1,0 +1,21 @@
+[Unit]
+Description=ALS Map MCP Cloudflare tunnel (als-map-mcp)
+Documentation=man:systemd.resource-control(5)
+After=network-online.target als-map-mcp-http.service
+Wants=network-online.target
+# Template shipped in-repo. Install via: scripts/als_map_isolate install-units
+# Tunnel is light; keep tight ceilings. No CPUQuota.
+
+[Service]
+Type=simple
+# Absolute path required by systemd; adjust if cloudflared lives elsewhere.
+ExecStart=/usr/local/bin/cloudflared --config %h/.cloudflared/config.yml tunnel run als-map-mcp
+Restart=on-failure
+RestartSec=3
+
+MemoryMax=256M
+TasksMax=32
+OOMScoreAdjust=100
+
+[Install]
+WantedBy=default.target
