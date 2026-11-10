@@ -4,6 +4,10 @@
 **/prod-mc-asset-server/
 **/export_data/
 
+# Official X/Twitter archive (GB-scale with media) — never commit
+twitter-*/
+*.zip
+
 # Normalized corpora (large JSONL) — generate locally, do not commit
 data/normalized/*.jsonl
 data/normalized/*.jsonl.gz

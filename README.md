@@ -1,32 +1,31 @@
 # ALS graph
 
-Personal corpus tools for Austen Strine (ALS = initials). Normalize Grok chat exports (and later X archive) into uniform JSONL for retrieval.
+Personal corpus tools for Austen Strine (ALS = initials). Normalize Grok chat exports and X archives into uniform JSONL for retrieval.
 
-## Quick start (Grok half)
+## Quick start
 
 ```bash
 pip install -r requirements.txt
 python scripts/normalize_grok.py
+python scripts/normalize_x.py
 ```
 
 Writes:
 
-- `data/normalized/grok.jsonl` — **local only** (gitignored; large)
-- `data/normalized/grok-stats.json` — counts / roles / models
+- `data/normalized/grok.jsonl` / `x.jsonl` — **local only** (gitignored; large)
+- `data/normalized/grok-stats.json` / `x-stats.json` — counts / roles / sources
 
 See [docs/normalization.md](docs/normalization.md) for the record schema and re-run notes.
 
-**Do not commit** the xAI export tree or `*.jsonl` corpora — they are hundreds of MB and will lock up git. Only scripts, docs, and small stats sidecars belong in version control.
+**Do not commit** the xAI export tree, X archive folders (`twitter-*/`), or `*.jsonl` corpora — they are hundreds of MB–GB and will lock up git. Only scripts, docs, and small stats sidecars belong in version control.
 
 ## Layout
 
 | Path | Purpose |
 |------|---------|
 | `scripts/normalize_grok.py` | Stream `prod-grok-backend.json` → JSONL |
+| `scripts/normalize_x.py` | Parse X archive `window.YTD.*` JS → JSONL |
 | `docs/normalization.md` | Schema + how to re-run |
 | `data/normalized/` | Generated outputs (JSONL gitignored) |
-| `10b2e090-…/export_data/…` | Raw export (gitignored; read-only) |
-
-## Future: X posts
-
-Classic X “Download your archive” is **not** in the current export. Add a sibling normalizer with `source: x_post` (etc.) when that archive is available — same top-level fields as Grok records.
+| `10b2e090-…/export_data/…` | Raw Grok export (gitignored; read-only) |
+| `twitter-*/` | Official X archive (gitignored; read-only) |

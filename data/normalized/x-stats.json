@@ -1,0 +1,54 @@
+{
+  "source": "x_archive",
+  "sources_emitted": [
+    "x_post",
+    "x_reply",
+    "x_like",
+    "x_repost",
+    "x_note"
+  ],
+  "archive": "/home/austen-loren-strine/Development/als_graph/twitter-2026-11-08-d3b063904b28d3226f33bc4beaa26808e19632023745c6bd0c3eb41cdd96d748",
+  "output": "/home/austen-loren-strine/Development/als_graph/data/normalized/x.jsonl",
+  "account": {
+    "username": "AustenStrine",
+    "account_id": "1518755348382953472",
+    "display_name": "🛡️Austen ⚜️ Strine⚔️",
+    "created_at": "2022-04-26T00:54:43.438Z"
+  },
+  "records": 33340,
+  "by_source": {
+    "x_repost": 9170,
+    "x_reply": 7670,
+    "x_post": 2438,
+    "x_like": 13903,
+    "x_note": 159
+  },
+  "roles": {
+    "self": 19437,
+    "null": 13903
+  },
+  "empty_text_records": 60,
+  "sections": {
+    "tweets.js": {
+      "items": 19278,
+      "bytes": 35367342
+    },
+    "like.js": {
+      "items": 13903,
+      "bytes": 4489269
+    },
+    "note-tweet.js": {
+      "items": 159,
+      "bytes": 225160
+    },
+    "deleted-tweets.js": {
+      "items_present": 10,
+      "emitted": 0,
+      "bytes": 13868,
+      "note": "present but not emitted (use --include-deleted)"
+    }
+  },
+  "role_policy": "role=self for authored posts/replies/reposts/notes; role=null for likes of others",
+  "elapsed_seconds": 0.66,
+  "generated_at": "2026-11-10T00:38:19Z"
+}
