@@ -52,15 +52,20 @@ usage() {
   cat <<EOF
 als_map_stack — ALS Map MCP HTTP + Cloudflare tunnel
 
-Commands:
-  start             Ensure token, enable+start units, print status
-  stop              Stop both units
-  restart           Restart both units, print status
-  status            Status panel (units, health, recent access)
+Everyday:
+  als_map_stack start      # enable+start HTTP MCP + tunnel
+  als_map_stack stop       # stop both units (easy off switch)
+  als_map_stack restart    # reload units after code/branch changes
+  als_map_stack status     # units, checkout, local+public health
+
+Also:
   logs [-f] [N]     Tail access log (default 50 lines; -f follow)
   doctor            Health checklist for required pieces
   watch             Start (if needed) then refresh status + follow access log
   install-desktop   Install desktop entry + icon + ~/.local/bin symlink
+
+After merging or checking out a branch that adds MCP tools, run restart
+so Grok / tools/list pick up the new code (live process does not auto-reload).
 
 Env:
   ALS_MAP_ACCESS_LOG  override access log path
@@ -167,7 +172,7 @@ cmd_start() {
 
 cmd_stop() {
   systemctl --user stop "$TUNNEL_UNIT" "$HTTP_UNIT" || true
-  echo "Stopped $HTTP_UNIT + $TUNNEL_UNIT"
+  echo "Stopped ALS Map MCP stack ($HTTP_UNIT + $TUNNEL_UNIT)"
   cmd_status
 }
 
@@ -176,7 +181,7 @@ cmd_restart() {
   systemctl --user daemon-reload
   systemctl --user restart "$HTTP_UNIT" "$TUNNEL_UNIT"
   sleep 0.8
-  echo "Restarted $HTTP_UNIT + $TUNNEL_UNIT"
+  echo "Restarted ALS Map MCP stack ($HTTP_UNIT + $TUNNEL_UNIT) — code reloaded from $REPO_ROOT"
   cmd_status
 }
 
@@ -197,10 +202,15 @@ cmd_status() {
   http_e="$(unit_enabled "$HTTP_UNIT")"
   tun_e="$(unit_enabled "$TUNNEL_UNIT")"
 
+  local git_branch git_head
+  git_branch="$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || echo "?")"
+  git_head="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "?")"
+
   echo
   bold "ALS Map MCP stack"
   echo
   echo "  $(dim "repo")     $REPO_ROOT"
+  echo "  $(dim "checkout") $git_branch @ $git_head"
   echo "  $(dim "token")    $TOKEN_FILE $( [[ -s "$TOKEN_FILE" ]] && ok || bad )"
   echo "  $(dim "env")      $ENV_FILE $( [[ -s "$ENV_FILE" ]] && ok || bad )"
   echo "  $(dim "access")   $ACCESS_LOG"

@@ -6,12 +6,16 @@ One command on Raider to run the HTTP MCP server + Cloudflare tunnel, show healt
 
 ```bash
 # from repo (or ~/.local/bin after install-desktop)
-./scripts/als_map_stack start
-./scripts/als_map_stack status
-./scripts/als_map_stack logs -f
-./scripts/als_map_stack doctor
-./scripts/als_map_stack install-desktop   # desktop icon + PATH symlink
+als_map_stack start      # bring HTTP MCP + tunnel up
+als_map_stack stop       # easy off switch (both units)
+als_map_stack restart    # required after code/branch changes
+als_map_stack status      # units, git checkout, local+public health
+als_map_stack logs -f
+als_map_stack doctor
+als_map_stack install-desktop   # desktop icon + PATH symlink
 ```
+
+**Restart after shipping tools.** The systemd unit runs whatever is checked out in `WorkingDirectory` (`~/Development/als_graph`). A live process keeps the old tool list until `als_map_stack restart` (or stop then start).
 
 ## What it manages
 
@@ -29,12 +33,21 @@ Public: `https://mcp.austenstrine.dev/mcp` — health `…/health`.
 | Command | Role |
 |---------|------|
 | `start` | Ensure token exists; enable+start both units; print status panel |
-| `stop` / `restart` | Stop or restart units |
-| `status` | Units active/enabled, local+public `/health`, recent access + journal lines |
+| `stop` | Stop tunnel then HTTP MCP (easy full off) |
+| `restart` | `daemon-reload` + restart both units; reloads code from the current checkout |
+| `status` | Units, **git branch/HEAD**, local+public `/health`, recent access + journal |
 | `logs [-f] [N]` | Tail access log (`-f` follow) |
 | `doctor` | Checklist: scripts, token, units, cloudflared, health endpoints |
 | `watch` | Start if needed, print status, follow access log + periodic health line |
 | `install-desktop` | Install `.desktop`, SVG icon, `~/.local/bin/als_map_stack` |
+
+Exact Austen commands:
+
+```bash
+als_map_stack stop
+als_map_stack start
+als_map_stack restart
+```
 
 ## Access log format
 
