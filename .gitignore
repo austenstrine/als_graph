@@ -13,17 +13,40 @@ data/normalized/*.jsonl
 data/normalized/*.jsonl.gz
 
 # Keep stats sidecar trackable (small); ignore accidental dumps
-# data/normalized/*-stats.json is OK to commit
+# data/normalized/*-stats.json is OK to commit (scrub absolute paths for public)
 
-# Map FTS index (sqlite + optional local stats) — generate locally, do not commit
+# Map FTS index (sqlite + WAL/SHM + local stats) — generate locally, do not commit
 data/index/
+
+# Embeddings / vector artifacts — generate locally, do not commit
+data/embeddings/
+data/vectors/
+**/*.faiss
+**/*embeddings*.sqlite
+**/*embed*.bin
+**/*embed*.npy
+
+# Secrets / tokens / tunnel creds (live under $HOME; never commit)
+.env
+.env.*
+!.env.example
+mcp_token
+**/mcp_token
+**/credentials.json
+**/*credentials*.json
+.cloudflared/
+**/.cloudflared/
+*.pem
+
+# Access / runtime logs
+access.log
+**/access.log
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-.env
 
 # OS / editor
 .DS_Store

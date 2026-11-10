@@ -6,8 +6,8 @@
     "x_like",
     "x_reply"
   ],
-  "input": "C:\\Development\\side-projects\\als_graph\\10b2e090-7b79-4786-bf86-6e2da0cd437e\\ttl\\30d\\export_data\\d9fcc965-ed34-4cb2-aad0-45f6f9a550fd\\prod-grok-backend.json",
-  "output": "C:\\Development\\side-projects\\als_graph\\data\\normalized\\grok.jsonl",
+  "input": "<local-grok-export>/prod-grok-backend.json",
+  "output": "data/normalized/grok.jsonl",
   "conversations": 1987,
   "records": 14994,
   "projects_indexed": 7,

@@ -46,7 +46,7 @@ Cursor MCP snippet (stdio):
     "als-map": {
       "command": "python3",
       "args": [
-        "/home/austen-loren-strine/Development/als_graph/scripts/als_map_mcp.py"
+        "/ABS/PATH/TO/als_graph/scripts/als_map_mcp.py"
       ]
     }
   }

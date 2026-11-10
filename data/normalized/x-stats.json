@@ -7,13 +7,10 @@
     "x_repost",
     "x_note"
   ],
-  "archive": "/home/austen-loren-strine/Development/als_graph/twitter-2026-11-08-d3b063904b28d3226f33bc4beaa26808e19632023745c6bd0c3eb41cdd96d748",
-  "output": "/home/austen-loren-strine/Development/als_graph/data/normalized/x.jsonl",
+  "archive": "<local-twitter-archive>/",
+  "output": "data/normalized/x.jsonl",
   "account": {
-    "username": "AustenStrine",
-    "account_id": "1518755348382953472",
-    "display_name": "🛡️Austen ⚜️ Strine⚔️",
-    "created_at": "2022-04-26T00:54:43.438Z"
+    "username": "AustenStrine"
   },
   "records": 33340,
   "by_source": {
