@@ -122,3 +122,7 @@ Archive sections used: `tweets.js` (19,278 · 34 MB), `like.js` (13,903 · 4.3
 **Roles:** `self` 19,437 · `null` 13,903 (likes).
 
 Export archives + JSONL are **gitignored** so they are never committed. Stats sidecars may be committed.
+
+## Next: map index + MCP
+
+After both JSONL files exist, build the local FTS map and (optionally) run the stdio MCP server — see [docs/map.md](map.md).

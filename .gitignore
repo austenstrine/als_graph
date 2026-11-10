@@ -15,6 +15,9 @@ data/normalized/*.jsonl.gz
 # Keep stats sidecar trackable (small); ignore accidental dumps
 # data/normalized/*-stats.json is OK to commit
 
+# Map FTS index (sqlite + optional local stats) — generate locally, do not commit
+data/index/
+
 # Python
 __pycache__/
 *.py[cod]
