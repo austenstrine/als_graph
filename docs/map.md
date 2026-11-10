@@ -1,8 +1,8 @@
-# Total ALS Map (Phase 1′ + 2′a + 2′b)
+# Total ALS Map (Phase 1′ + 2′a + 2′b + 2′c)
 
 Queryable personal corpus: **X posts/replies/reposts/likes/notes + every Grok turn** from the normalized JSONL, indexed in local SQLite FTS5 (+ optional local embeddings) for **retrieval-backed analysis by Grok** (via Cursor MCP tools).
 
-This is a **retrieval map substrate**, not a UI/graph product. Phase **2′a** adds prior-free sample / style / contrast. Phase **2′b** adds **local-only** semantic search (no corpus upload / no remote embed API).
+This is a **retrieval map substrate**, not a UI/graph product. Phase **2′a** adds prior-free sample / style / contrast. Phase **2′b** adds **local-only** semantic search (no corpus upload / no remote embed API). Phase **2′c** adds **heuristic thread features** (no LLM labels).
 
 ## Corpus boundary (Total v1)
 
@@ -55,6 +55,17 @@ uv pip install --python .venv/bin/python -r requirements-embed.txt
 ```
 
 Fingerprint skip (inputs + model + embed schema) mirrors FTS. Soft timebox: escalate if model download/build exceeds ~90 minutes.
+
+## Build thread features (Phase 2′c)
+
+Heuristic tags stored in `thread_features` inside `als_map.sqlite` (same DB; no LLM). Built automatically by `build_map_index.py`; refresh without FTS rebuild:
+
+```bash
+python scripts/build_thread_features.py
+python scripts/build_thread_features.py --force
+```
+
+Per-thread fields: message counts + human/assistant/self ratio, refine/critique cue counts (regex on `human`|`self`), code/tech density. Documented as approximate in tool output.
 
 ## Debug CLI (not the product)
 
@@ -186,10 +197,11 @@ Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in
 | `als_thread` | Ordered turns for `thread_id` (default window ≤30) |
 | `als_browse` | Keywordless chronological window |
 | `als_stats` | Counts; breakdown `source` \| `role` \| `month` \| `both` |
-| `als_sample` | Prior-free random sample; `n`≤50; `role?` / `source?` (`x`\|`grok` or specific); `stratify_by` `none`\|`time`\|`thread_length`; `seed?` |
+| `als_sample` | Prior-free random sample; `n`≤50; `role?` / `source?` (`x`\|`grok` or specific); `stratify_by` `none`\|`time`\|`thread_length`; `seed?`; optional thread-feature filters (`min_thread_length` / `has_refine` / `has_critique` / `min_code_density`) |
 | `als_style_stats` | Deterministic style aggregates for a slice (`source?` / `role?` / `since?` / `until?`) |
 | `als_contrast` | Two-slice compare (sources and/or time windows) with deltas on the same metrics |
 | `als_semantic_search` | Local embedding NN search; `query`; filters `source(s)?` / `role?` / `since?` / `until?`; limit ≤50 |
+| `als_thread_features` | Heuristic per-thread features (no LLM); `thread_id?` or filter/list (`source?` / length / refine / critique / density); limit ≤50 |
 
 Every hit includes cite fields: `id`, `source`, `created_at`, `url`, `thread_id`, `role`.
 
@@ -208,9 +220,10 @@ Primary ongoing cost is **agent/Grok context tokens**, not index CPU.
 
 | Path | Purpose |
 |------|---------|
-| `scripts/als_map_lib.py` | Shared build + query library (FTS + embeddings) |
+| `scripts/als_map_lib.py` | Shared build + query library (FTS + embeddings + thread features) |
 | `scripts/build_map_index.py` | JSONL → sqlite |
 | `scripts/build_map_embeddings.py` | sqlite → local embedding `.npz` |
+| `scripts/build_thread_features.py` | sqlite → heuristic `thread_features` table |
 | `scripts/map_query.py` | Debug CLI |
 | `scripts/als_map_mcp.py` | Stdio MCP server |
 | `scripts/als_map_mcp_http.py` | Streamable HTTP MCP + Bearer auth |

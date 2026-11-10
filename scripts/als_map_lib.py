@@ -4,8 +4,9 @@ Shared library for the Total ALS Map retrieval substrate.
 
 SQLite + external-content FTS5 over normalized Grok/X JSONL.
 Optional Phase 2′b local embeddings (numpy + sentence-transformers).
-Used by build_map_index.py, build_map_embeddings.py, map_query.py,
-and als_map_mcp.py.
+Phase 2′c heuristic thread_features (no LLM).
+Used by build_map_index.py, build_map_embeddings.py,
+build_thread_features.py, map_query.py, and als_map_mcp.py.
 """
 from __future__ import annotations
 
@@ -55,6 +56,11 @@ EMBED_RAM_GUIDANCE = 28_324_106_240  # floor(0.50 * MemAvailable); not pre-alloc
 DEFAULT_EMBED_BATCH = 64
 _EMBED_INDEX_CACHE: dict[str, Any] = {}
 _EMBED_MODEL_CACHE: dict[str, Any] = {}
+
+# Phase 2′c heuristic thread features (no LLM).
+THREAD_FEATURES_SCHEMA_VERSION = 1
+THREAD_FEATURES_META_KEY = "thread_features"
+DEFAULT_THREAD_FEATURES_LIMIT = 20
 
 CITE_FIELDS = ("id", "source", "created_at", "url", "thread_id", "role")
 
@@ -107,6 +113,68 @@ _THREAD_LENGTH_BUCKETS: tuple[tuple[str, int, int | None], ...] = (
     ("6-20", 6, 20),
     ("21+", 21, None),
 )
+
+# Approximate edit/refine + critique cues on human/self turns only.
+_REFINE_CUE_RE = re.compile(
+    r"\b("
+    r"try again|rewrite|revis(?:e|ion)|rephrase|tweak|adjust|"
+    r"edit(?:\s+this|\s+it)?|instead|make it|"
+    r"change (?:the|this|it)|update (?:the|this|it)|"
+    r"fix(?:\s+it|\s+this)?|rather|more like|less like|"
+    r"shorter|longer|again but"
+    r")\b",
+    re.IGNORECASE,
+)
+_CRITIQUE_CUE_RE = re.compile(
+    r"\b("
+    r"critique|review this|what do you think|"
+    r"is this (?:wrong|correct|right)|feedback|honest opinion|"
+    r"roast|tear apart|spot (?:the|any)|any issues|what'?s wrong|"
+    r"does this (?:make sense|work)|am i (?:crazy|wrong)|"
+    r"be critical|brutal(?:ly)? honest"
+    r")\b",
+    re.IGNORECASE,
+)
+_CODE_MARK_RE = re.compile(
+    r"(```|^\s{0,3}(def |class |function |import |from .+ import |"
+    r"#include |package )|;\s*$|\{\s*$)",
+    re.MULTILINE,
+)
+_TECH_MARK_RE = re.compile(
+    r"\b("
+    r"api|http|https|sql|json|python|typescript|javascript|docker|linux|"
+    r"git|regex|algorithm|latency|throughput|gpu|cuda|systemd|oauth|jwt|"
+    r"sqlite|postgres|kubernetes|webpack|react|css|html|tcp|udp|dns|"
+    r"clang|rust|golang|nodejs|npm|pip|venv|ssh|nginx|cloudflare"
+    r")\b",
+    re.IGNORECASE,
+)
+_THREAD_FEATURES_DDL = """
+CREATE TABLE IF NOT EXISTS thread_features (
+    thread_id TEXT PRIMARY KEY,
+    message_count INTEGER NOT NULL,
+    human_count INTEGER NOT NULL,
+    assistant_count INTEGER NOT NULL,
+    self_count INTEGER NOT NULL,
+    other_role_count INTEGER NOT NULL,
+    human_assistant_ratio REAL,
+    refine_cue_count INTEGER NOT NULL,
+    critique_cue_count INTEGER NOT NULL,
+    code_msg_count INTEGER NOT NULL,
+    code_density REAL NOT NULL,
+    tech_msg_count INTEGER NOT NULL,
+    tech_density REAL NOT NULL,
+    has_refine INTEGER NOT NULL,
+    has_critique INTEGER NOT NULL,
+    source_primary TEXT,
+    first_created_at TEXT,
+    last_created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_thread_features_len
+    ON thread_features(message_count);
+CREATE INDEX IF NOT EXISTS idx_thread_features_flags
+    ON thread_features(has_refine, has_critique, code_density);
+"""
 
 
 @dataclass(frozen=True)
@@ -182,6 +250,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         DROP TABLE IF EXISTS records_fts;
+        DROP TABLE IF EXISTS thread_features;
         DROP TABLE IF EXISTS records;
         DROP TABLE IF EXISTS map_meta;
 
@@ -215,6 +284,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    conn.executescript(_THREAD_FEATURES_DDL)
 
 
 def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -377,6 +447,8 @@ def build_index(
             "INSERT INTO map_meta(key, value) VALUES (?, ?)",
             ("record_count", str(total)),
         )
+        # Phase 2′c heuristics — same fingerprint as FTS rows.
+        build_thread_features(conn, force=True, records_fingerprint=fp.digest())
         conn.commit()
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
@@ -940,6 +1012,10 @@ def sample(
     stratify_by: str | None = "none",
     seed: int | None = None,
     max_chars: int | None = None,
+    min_thread_length: int | None = None,
+    has_refine: bool | None = None,
+    has_critique: bool | None = None,
+    min_code_density: float | None = None,
 ) -> dict[str, Any]:
     """Prior-free stratified random sample (snippet-shaped like search)."""
     lim = _clamp_limit(n, DEFAULT_SAMPLE_N)
@@ -949,6 +1025,19 @@ def sample(
     max_c = _clamp_chars(max_chars, DEFAULT_SNIPPET_CHARS, MAX_SNIPPET_CHARS)
     src_arg = source if source is not None else sources
     where_sql, params = _filter_where(sources=src_arg, role=role)
+    feature_filters = {
+        "min_thread_length": min_thread_length,
+        "has_refine": has_refine,
+        "has_critique": has_critique,
+        "min_code_density": min_code_density,
+    }
+    thread_allow = _matching_thread_ids(
+        conn,
+        min_thread_length=min_thread_length,
+        has_refine=has_refine,
+        has_critique=has_critique,
+        min_code_density=min_code_density,
+    )
 
     rows = conn.execute(
         f"""
@@ -958,6 +1047,8 @@ def sample(
         """,
         params,
     ).fetchall()
+    if thread_allow is not None:
+        rows = [r for r in rows if r["thread_id"] in thread_allow]
     total = len(rows)
     rng = random.Random(seed)
 
@@ -980,18 +1071,25 @@ def sample(
                     key = "unknown"
                 groups.setdefault(key, []).append(row)
         else:  # thread_length
-            length_rows = conn.execute(
-                f"""
-                SELECT r.thread_id AS thread_id, COUNT(*) AS n
-                FROM records r
-                WHERE r.thread_id IN (
-                    SELECT DISTINCT thread_id FROM records WHERE {where_sql}
-                )
-                GROUP BY r.thread_id
-                """,
-                params,
-            ).fetchall()
-            lengths = {r["thread_id"]: int(r["n"]) for r in length_rows}
+            if thread_allow is None:
+                length_rows = conn.execute(
+                    f"""
+                    SELECT r.thread_id AS thread_id, COUNT(*) AS n
+                    FROM records r
+                    WHERE r.thread_id IN (
+                        SELECT DISTINCT thread_id FROM records WHERE {where_sql}
+                    )
+                    GROUP BY r.thread_id
+                    """,
+                    params,
+                ).fetchall()
+                lengths = {r["thread_id"]: int(r["n"]) for r in length_rows}
+            else:
+                lengths = {
+                    tid: int(feat["message_count"])
+                    for tid, feat in _thread_features_map(conn).items()
+                    if tid in thread_allow
+                }
             for row in rows:
                 key = _thread_length_bucket(lengths.get(row["thread_id"], 1))
                 groups.setdefault(key, []).append(row)
@@ -1049,6 +1147,7 @@ def sample(
             "source": src_arg,
             "stratify_by": strat,
             "seed": seed,
+            "feature_filters": feature_filters,
             "eligible": total,
             "returned": len(hits),
             "buckets": buckets_meta,
@@ -1771,6 +1870,485 @@ def semantic_search(
             "returned": len(hits),
             "model": model_name,
             "hits": hits,
+        }
+    )
+
+
+def _is_humanish_role(role: str | None) -> bool:
+    return role in ("human", "self")
+
+
+def _message_cue_flags(text: str, *, humanish: bool) -> tuple[int, int, int, int]:
+    """Return (refine, critique, code, tech) 0/1 flags for one message."""
+    body = text or ""
+    refine = 1 if humanish and _REFINE_CUE_RE.search(body) else 0
+    critique = 1 if humanish and _CRITIQUE_CUE_RE.search(body) else 0
+    code = 1 if _CODE_MARK_RE.search(body) else 0
+    tech = 1 if _TECH_MARK_RE.search(body) else 0
+    return refine, critique, code, tech
+
+
+def _finalize_thread_feature(acc: dict[str, Any]) -> dict[str, Any]:
+    message_count = int(acc["message_count"])
+    humanish = int(acc["human_count"]) + int(acc["self_count"])
+    assistant = int(acc["assistant_count"])
+    ratio = None if assistant == 0 else round(humanish / assistant, 6)
+    code_density = (
+        0.0 if message_count == 0 else round(int(acc["code_msg_count"]) / message_count, 6)
+    )
+    tech_density = (
+        0.0 if message_count == 0 else round(int(acc["tech_msg_count"]) / message_count, 6)
+    )
+    source_counts: Counter[str] = acc["source_counts"]
+    source_primary = source_counts.most_common(1)[0][0] if source_counts else None
+    return {
+        "thread_id": acc["thread_id"],
+        "message_count": message_count,
+        "human_count": int(acc["human_count"]),
+        "assistant_count": assistant,
+        "self_count": int(acc["self_count"]),
+        "other_role_count": int(acc["other_role_count"]),
+        "human_assistant_ratio": ratio,
+        "refine_cue_count": int(acc["refine_cue_count"]),
+        "critique_cue_count": int(acc["critique_cue_count"]),
+        "code_msg_count": int(acc["code_msg_count"]),
+        "code_density": code_density,
+        "tech_msg_count": int(acc["tech_msg_count"]),
+        "tech_density": tech_density,
+        "has_refine": 1 if int(acc["refine_cue_count"]) > 0 else 0,
+        "has_critique": 1 if int(acc["critique_cue_count"]) > 0 else 0,
+        "source_primary": source_primary,
+        "first_created_at": acc["first_created_at"],
+        "last_created_at": acc["last_created_at"],
+    }
+
+
+def _empty_thread_acc(thread_id: str) -> dict[str, Any]:
+    return {
+        "thread_id": thread_id,
+        "message_count": 0,
+        "human_count": 0,
+        "assistant_count": 0,
+        "self_count": 0,
+        "other_role_count": 0,
+        "refine_cue_count": 0,
+        "critique_cue_count": 0,
+        "code_msg_count": 0,
+        "tech_msg_count": 0,
+        "source_counts": Counter(),
+        "first_created_at": None,
+        "last_created_at": None,
+        "_first_key": None,
+        "_last_key": None,
+    }
+
+
+def _accumulate_message(acc: dict[str, Any], row: sqlite3.Row | dict[str, Any]) -> None:
+    get = row.__getitem__
+    role = get("role")
+    text = get("text") or ""
+    created = get("created_at")
+    source = get("source")
+    rid = get("id")
+    acc["message_count"] += 1
+    if role == "human":
+        acc["human_count"] += 1
+    elif role == "assistant":
+        acc["assistant_count"] += 1
+    elif role == "self":
+        acc["self_count"] += 1
+    else:
+        acc["other_role_count"] += 1
+    humanish = _is_humanish_role(role)
+    refine, critique, code, tech = _message_cue_flags(text, humanish=humanish)
+    acc["refine_cue_count"] += refine
+    acc["critique_cue_count"] += critique
+    acc["code_msg_count"] += code
+    acc["tech_msg_count"] += tech
+    if source:
+        acc["source_counts"][source] += 1
+    key = (1 if created is None else 0, created or "", rid or "")
+    if acc["_first_key"] is None or key < acc["_first_key"]:
+        acc["_first_key"] = key
+        acc["first_created_at"] = created
+    if acc["_last_key"] is None or key > acc["_last_key"]:
+        acc["_last_key"] = key
+        acc["last_created_at"] = created
+
+
+def compute_thread_feature(
+    conn: sqlite3.Connection, thread_id: str
+) -> dict[str, Any] | None:
+    """Compute heuristic features for one thread (no table required)."""
+    if not thread_id:
+        raise ValueError("thread_id is required")
+    rows = conn.execute(
+        """
+        SELECT id, source, created_at, role, text
+        FROM records
+        WHERE thread_id = ?
+        ORDER BY
+          CASE WHEN created_at IS NULL THEN 1 ELSE 0 END,
+          created_at ASC,
+          id ASC
+        """,
+        (thread_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    acc = _empty_thread_acc(thread_id)
+    for row in rows:
+        _accumulate_message(acc, row)
+    return _finalize_thread_feature(acc)
+
+
+def _compute_all_thread_features(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    accs: dict[str, dict[str, Any]] = {}
+    for row in conn.execute(
+        "SELECT id, source, created_at, thread_id, role, text FROM records"
+    ):
+        tid = row["thread_id"]
+        acc = accs.get(tid)
+        if acc is None:
+            acc = _empty_thread_acc(tid)
+            accs[tid] = acc
+        _accumulate_message(acc, row)
+    return {tid: _finalize_thread_feature(acc) for tid, acc in accs.items()}
+
+
+def _thread_features_table_ready(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_features'"
+    ).fetchone()
+    return row is not None
+
+
+def _records_fingerprint_digest(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        "SELECT value FROM map_meta WHERE key='fingerprint'"
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["value"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    digest = payload.get("digest")
+    return digest if isinstance(digest, str) else None
+
+
+def _thread_features_meta(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT value FROM map_meta WHERE key=?",
+        (THREAD_FEATURES_META_KEY,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        meta = json.loads(row["value"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def build_thread_features(
+    conn: sqlite3.Connection,
+    *,
+    force: bool = False,
+    records_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Rebuild thread_features table (writable connection required)."""
+    fp = records_fingerprint or _records_fingerprint_digest(conn)
+    prior = _thread_features_meta(conn)
+    if (
+        not force
+        and prior is not None
+        and prior.get("schema_version") == THREAD_FEATURES_SCHEMA_VERSION
+        and prior.get("records_fingerprint") == fp
+        and _thread_features_table_ready(conn)
+    ):
+        count_row = conn.execute("SELECT COUNT(*) AS n FROM thread_features").fetchone()
+        return {
+            "skipped": True,
+            "reason": "fingerprint_match",
+            "threads": int(count_row["n"]) if count_row else 0,
+            "schema_version": THREAD_FEATURES_SCHEMA_VERSION,
+            "records_fingerprint": fp,
+        }
+
+    t0 = time.perf_counter()
+    features = _compute_all_thread_features(conn)
+    conn.executescript(
+        """
+        DROP TABLE IF EXISTS thread_features;
+        """
+    )
+    conn.executescript(_THREAD_FEATURES_DDL)
+    rows = [
+        (
+            f["thread_id"],
+            f["message_count"],
+            f["human_count"],
+            f["assistant_count"],
+            f["self_count"],
+            f["other_role_count"],
+            f["human_assistant_ratio"],
+            f["refine_cue_count"],
+            f["critique_cue_count"],
+            f["code_msg_count"],
+            f["code_density"],
+            f["tech_msg_count"],
+            f["tech_density"],
+            f["has_refine"],
+            f["has_critique"],
+            f["source_primary"],
+            f["first_created_at"],
+            f["last_created_at"],
+        )
+        for f in features.values()
+    ]
+    conn.executemany(
+        """
+        INSERT INTO thread_features (
+            thread_id, message_count, human_count, assistant_count, self_count,
+            other_role_count, human_assistant_ratio, refine_cue_count,
+            critique_cue_count, code_msg_count, code_density, tech_msg_count,
+            tech_density, has_refine, has_critique, source_primary,
+            first_created_at, last_created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    built_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    meta = {
+        "schema_version": THREAD_FEATURES_SCHEMA_VERSION,
+        "records_fingerprint": fp,
+        "threads": len(rows),
+        "built_at": built_at,
+        "note": (
+            "Heuristic only (regex refine/critique on human|self; "
+            "code/tech density over all turns). No LLM labels."
+        ),
+    }
+    conn.execute(
+        "INSERT INTO map_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (THREAD_FEATURES_META_KEY, json.dumps(meta, separators=(",", ":"))),
+    )
+    conn.commit()
+    return {
+        "skipped": False,
+        "threads": len(rows),
+        "schema_version": THREAD_FEATURES_SCHEMA_VERSION,
+        "records_fingerprint": fp,
+        "built_at": built_at,
+        "elapsed_s": round(time.perf_counter() - t0, 3),
+    }
+
+
+def _feature_row_to_dict(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    get = row.__getitem__
+    return {
+        "thread_id": get("thread_id"),
+        "message_count": int(get("message_count")),
+        "human_count": int(get("human_count")),
+        "assistant_count": int(get("assistant_count")),
+        "self_count": int(get("self_count")),
+        "other_role_count": int(get("other_role_count")),
+        "human_assistant_ratio": get("human_assistant_ratio"),
+        "refine_cue_count": int(get("refine_cue_count")),
+        "critique_cue_count": int(get("critique_cue_count")),
+        "code_msg_count": int(get("code_msg_count")),
+        "code_density": float(get("code_density")),
+        "tech_msg_count": int(get("tech_msg_count")),
+        "tech_density": float(get("tech_density")),
+        "has_refine": bool(int(get("has_refine"))),
+        "has_critique": bool(int(get("has_critique"))),
+        "source_primary": get("source_primary"),
+        "first_created_at": get("first_created_at"),
+        "last_created_at": get("last_created_at"),
+    }
+
+
+def _thread_features_map(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """Load features from table when fresh; else compute in-memory (readonly-safe)."""
+    fp = _records_fingerprint_digest(conn)
+    meta = _thread_features_meta(conn)
+    if (
+        _thread_features_table_ready(conn)
+        and meta is not None
+        and meta.get("schema_version") == THREAD_FEATURES_SCHEMA_VERSION
+        and meta.get("records_fingerprint") == fp
+    ):
+        out: dict[str, dict[str, Any]] = {}
+        for row in conn.execute("SELECT * FROM thread_features"):
+            feat = _feature_row_to_dict(row)
+            out[feat["thread_id"]] = feat
+        return out
+    return _compute_all_thread_features(conn)
+
+
+def _matching_thread_ids(
+    conn: sqlite3.Connection,
+    *,
+    min_thread_length: int | None = None,
+    max_thread_length: int | None = None,
+    has_refine: bool | None = None,
+    has_critique: bool | None = None,
+    min_code_density: float | None = None,
+    min_tech_density: float | None = None,
+    source: str | Sequence[str] | None = None,
+) -> set[str] | None:
+    """Return matching thread_ids, or None when no feature filters are set."""
+    srcs = _parse_sources(source)
+    if (
+        min_thread_length is None
+        and max_thread_length is None
+        and has_refine is None
+        and has_critique is None
+        and min_code_density is None
+        and min_tech_density is None
+        and srcs is None
+    ):
+        return None
+
+    allow: set[str] = set()
+    for tid, feat in _thread_features_map(conn).items():
+        if min_thread_length is not None and feat["message_count"] < int(min_thread_length):
+            continue
+        if max_thread_length is not None and feat["message_count"] > int(max_thread_length):
+            continue
+        if has_refine is not None and bool(feat["has_refine"]) != bool(has_refine):
+            continue
+        if has_critique is not None and bool(feat["has_critique"]) != bool(has_critique):
+            continue
+        if min_code_density is not None and float(feat["code_density"]) < float(
+            min_code_density
+        ):
+            continue
+        if min_tech_density is not None and float(feat["tech_density"]) < float(
+            min_tech_density
+        ):
+            continue
+        if srcs is not None and feat.get("source_primary") not in srcs:
+            continue
+        allow.add(tid)
+    return allow
+
+
+def thread_features(
+    conn: sqlite3.Connection,
+    *,
+    thread_id: str | None = None,
+    source: str | Sequence[str] | None = None,
+    min_thread_length: int | None = None,
+    max_thread_length: int | None = None,
+    has_refine: bool | None = None,
+    has_critique: bool | None = None,
+    min_code_density: float | None = None,
+    min_tech_density: float | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Heuristic per-thread features (single id or filtered list, ≤50)."""
+    lim = _clamp_limit(limit, DEFAULT_THREAD_FEATURES_LIMIT)
+    off = max(0, int(offset))
+    note = (
+        "Approximate heuristics only — refine/critique cues are regex on "
+        "human|self turns; code/tech density is marker share across all turns. "
+        "No LLM labels."
+    )
+
+    if thread_id:
+        feat = None
+        fmap = None
+        fp = _records_fingerprint_digest(conn)
+        meta = _thread_features_meta(conn)
+        if (
+            _thread_features_table_ready(conn)
+            and meta is not None
+            and meta.get("schema_version") == THREAD_FEATURES_SCHEMA_VERSION
+            and meta.get("records_fingerprint") == fp
+        ):
+            row = conn.execute(
+                "SELECT * FROM thread_features WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if row is not None:
+                feat = _feature_row_to_dict(row)
+        if feat is None:
+            feat = compute_thread_feature(conn, thread_id)
+        if feat is None:
+            return _fit_response(
+                {
+                    "op": "thread_features",
+                    "thread_id": thread_id,
+                    "found": False,
+                    "note": note,
+                }
+            )
+        # Normalize bools for single-thread payload consistency with list mode.
+        out_feat = dict(feat)
+        out_feat["has_refine"] = bool(out_feat["has_refine"])
+        out_feat["has_critique"] = bool(out_feat["has_critique"])
+        return _fit_response(
+            {
+                "op": "thread_features",
+                "thread_id": thread_id,
+                "found": True,
+                "feature": out_feat,
+                "note": note,
+                "schema_version": THREAD_FEATURES_SCHEMA_VERSION,
+            }
+        )
+
+    fmap = _thread_features_map(conn)
+    allow = _matching_thread_ids(
+        conn,
+        min_thread_length=min_thread_length,
+        max_thread_length=max_thread_length,
+        has_refine=has_refine,
+        has_critique=has_critique,
+        min_code_density=min_code_density,
+        min_tech_density=min_tech_density,
+        source=source,
+    )
+    items = list(fmap.values()) if allow is None else [fmap[t] for t in allow if t in fmap]
+    items.sort(
+        key=lambda f: (
+            -int(f["message_count"]),
+            f.get("last_created_at") or "",
+            f["thread_id"],
+        )
+    )
+    total = len(items)
+    page = items[off : off + lim]
+    hits = []
+    for feat in page:
+        item = dict(feat)
+        item["has_refine"] = bool(item["has_refine"])
+        item["has_critique"] = bool(item["has_critique"])
+        hits.append(item)
+
+    return _fit_response(
+        {
+            "op": "thread_features",
+            "filters": {
+                "source": source,
+                "min_thread_length": min_thread_length,
+                "max_thread_length": max_thread_length,
+                "has_refine": has_refine,
+                "has_critique": has_critique,
+                "min_code_density": min_code_density,
+                "min_tech_density": min_tech_density,
+            },
+            "total": total,
+            "limit": lim,
+            "offset": off,
+            "returned": len(hits),
+            "hits": hits,
+            "note": note,
+            "schema_version": THREAD_FEATURES_SCHEMA_VERSION,
         }
     )
 

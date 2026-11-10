@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-stdio MCP server for the Total ALS Map (Phase 1′ + 2′a + 2′b product surface).
+stdio MCP server for the Total ALS Map (Phase 1′ + 2′a + 2′b + 2′c surface).
 
 Tools (hard-capped via als_map_lib):
   als_search, als_get, als_get_many, als_thread, als_browse, als_stats,
-  als_sample, als_style_stats, als_contrast, als_semantic_search
+  als_sample, als_style_stats, als_contrast, als_semantic_search,
+  als_thread_features
 
 Protocol: MCP over JSON-RPC 2.0 on stdin/stdout (Content-Length framing
 compatible with the MCP stdio transport). Core tools are stdlib-only;
@@ -48,10 +49,11 @@ from als_map_lib import (  # noqa: E402
     stats,
     style_stats,
     thread,
+    thread_features,
 )
 
 SERVER_NAME = "als-map"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 # Log to stderr only — stdout is the MCP transport.
@@ -212,6 +214,25 @@ TOOL_DEFS: list[dict[str, Any]] = [
                     "type": "integer",
                     "description": "Snippet char cap (default 400, max 2000)",
                 },
+                "min_thread_length": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Only records whose thread has at least this many messages",
+                },
+                "has_refine": {
+                    "type": "boolean",
+                    "description": "Filter by heuristic edit/refine cues on the thread",
+                },
+                "has_critique": {
+                    "type": "boolean",
+                    "description": "Filter by heuristic critique-request cues on the thread",
+                },
+                "min_code_density": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Min share of messages with code-ish markers (0–1)",
+                },
             },
         },
     },
@@ -290,6 +311,44 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 },
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "als_thread_features",
+        "description": (
+            "Heuristic per-thread features (no LLM): message length, "
+            "human/assistant/self counts + ratio, edit/refine cues, "
+            "critique-request cues, code/tech density. "
+            "Pass thread_id for one thread, or filter/list threads (limit≤50)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "If set, return features for this thread only",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "x|grok shorthand or specific source (filters source_primary)",
+                },
+                "min_thread_length": {"type": "integer", "minimum": 1},
+                "max_thread_length": {"type": "integer", "minimum": 1},
+                "has_refine": {"type": "boolean"},
+                "has_critique": {"type": "boolean"},
+                "min_code_density": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+                "min_tech_density": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "offset": {"type": "integer", "minimum": 0},
+            },
         },
     },
 ]
@@ -375,6 +434,8 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                 payload = stats(conn, breakdown=args.get("breakdown") or "source")
             elif name == "als_sample":
                 seed = args.get("seed")
+                min_len = args.get("min_thread_length")
+                min_code = args.get("min_code_density")
                 payload = sample(
                     conn,
                     n=args.get("n"),
@@ -383,6 +444,12 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                     stratify_by=args.get("stratify_by") or "none",
                     seed=None if seed is None else int(seed),
                     max_chars=args.get("max_chars"),
+                    min_thread_length=None if min_len is None else int(min_len),
+                    has_refine=args.get("has_refine"),
+                    has_critique=args.get("has_critique"),
+                    min_code_density=(
+                        None if min_code is None else float(min_code)
+                    ),
                 )
             elif name == "als_style_stats":
                 payload = style_stats(
@@ -415,6 +482,29 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                     until=args.get("until"),
                     limit=args.get("limit"),
                     max_chars=args.get("max_chars"),
+                )
+            elif name == "als_thread_features":
+                min_len = args.get("min_thread_length")
+                max_len = args.get("max_thread_length")
+                min_code = args.get("min_code_density")
+                min_tech = args.get("min_tech_density")
+                tid = args.get("thread_id")
+                payload = thread_features(
+                    conn,
+                    thread_id=None if tid in (None, "") else str(tid),
+                    source=args.get("source") or args.get("sources"),
+                    min_thread_length=None if min_len is None else int(min_len),
+                    max_thread_length=None if max_len is None else int(max_len),
+                    has_refine=args.get("has_refine"),
+                    has_critique=args.get("has_critique"),
+                    min_code_density=(
+                        None if min_code is None else float(min_code)
+                    ),
+                    min_tech_density=(
+                        None if min_tech is None else float(min_tech)
+                    ),
+                    limit=args.get("limit"),
+                    offset=int(args.get("offset") or 0),
                 )
             else:
                 return _tool_result({"error": f"unknown tool: {name}"}, is_error=True)
