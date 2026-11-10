@@ -81,10 +81,11 @@ export ALS_MAP_MCP_TOKEN="$(openssl rand -hex 32)"
 python scripts/als_map_mcp_http.py
 ```
 
-- Default bind: `127.0.0.1:8787`
+- Default bind: `127.0.0.1:8787` (non-loopback hosts refused unless `ALS_MAP_MCP_ALLOW_NONLOCAL=1`)
 - MCP endpoint: `http://127.0.0.1:8787/mcp`
 - Liveness (no auth): `http://127.0.0.1:8787/health`
 - Every `/mcp` request needs `Authorization: Bearer $ALS_MAP_MCP_TOKEN`
+- Auth uses timing-safe compare; request bodies capped at 1 MiB; keep the origin on loopback and put Cloudflare Tunnel in front when public
 
 ### Curl smoke
 
