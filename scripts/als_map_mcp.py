@@ -7,8 +7,6 @@ Tools (hard-capped via als_map_lib):
   als_sample, als_style_stats, als_contrast, als_semantic_search,
   als_thread_features
 
-Plus letter stubs als_a … als_z (self-describing; unimplemented).
-
 Protocol: MCP over JSON-RPC 2.0 on stdin/stdout (Content-Length framing
 compatible with the MCP stdio transport). Core tools are stdlib-only;
 als_semantic_search needs repo .venv deps (numpy + sentence-transformers).
@@ -31,7 +29,6 @@ from __future__ import annotations
 
 import json
 import os
-import string
 import sys
 import traceback
 from pathlib import Path
@@ -56,78 +53,8 @@ from als_map_lib import (  # noqa: E402
 )
 
 SERVER_NAME = "als-map"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.5.1"
 PROTOCOL_VERSION = "2024-11-05"
-
-# Reserved single-letter slots (listed after real tools in TOOL_DEFS).
-LETTER_STUB_NAMES: tuple[str, ...] = tuple(f"als_{c}" for c in string.ascii_lowercase)
-
-
-def _letter_stub_description(name: str) -> str:
-    """Long, zero-context description so Grok can use the stub without Project docs."""
-    letter = name.removeprefix("als_")
-    return (
-        f"`{name}` is a reserved letter-slot tool on the ALS Map MCP "
-        f"(slot `{letter}` of `als_a`…`als_z`). It is a placeholder for a "
-        "future corpus retrieval or analysis capability that is not "
-        "implemented yet. "
-        f"When to call: only if you need to probe whether `{name}` exists, "
-        "to read its self-description, or to check later whether the slot "
-        "has been filled in. Do not call it expecting search, stats, thread, "
-        "or other corpus results — use working tools such as `als_search`, "
-        "`als_stats`, `als_get`, `als_thread`, `als_browse`, `als_sample`, "
-        "`als_style_stats`, `als_contrast`, `als_semantic_search`, or "
-        "`als_thread_features` for real work. "
-        "How to call: invoke with an empty object `{}`, or optionally "
-        "`{\"note\": \"…\"}` (any string; ignored). No fields are required. "
-        "What you get today: a short JSON self-description whose `status` "
-        'is exactly "This route does nothing yet." and `implemented` is '
-        "false. "
-        f"How to call again later: re-invoke `{name}` the same way after "
-        "the server is updated; if the slot is still a stub you will get "
-        "the same unimplemented message, and if it becomes a real tool the "
-        "description and result shape will change accordingly."
-    )
-
-
-def _letter_stub_tool_def(name: str) -> dict[str, Any]:
-    return {
-        "name": name,
-        "description": _letter_stub_description(name),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "note": {
-                    "type": "string",
-                    "description": (
-                        "Optional free-text note. Accepted and echoed as "
-                        "`note_ignored`; does not change behavior. Omit for "
-                        "a bare probe."
-                    ),
-                },
-            },
-        },
-    }
-
-
-def letter_stub_payload(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Self-description payload for unimplemented letter stubs."""
-    args = arguments or {}
-    note = args.get("note")
-    payload: dict[str, Any] = {
-        "tool": name,
-        "purpose": _letter_stub_description(name),
-        "how_to_interact": (
-            f"Call `{name}` with `{{}}` or optional `{{\"note\": \"…\"}}`. "
-            "No required fields. Re-call later the same way to see if the "
-            "slot was implemented."
-        ),
-        "status": "This route does nothing yet.",
-        "implemented": False,
-    }
-    if note is not None:
-        payload["note_ignored"] = str(note)
-    return payload
 
 # Log to stderr only — stdout is the MCP transport.
 def log(msg: str) -> None:
@@ -426,9 +353,6 @@ TOOL_DEFS: list[dict[str, Any]] = [
     },
 ]
 
-# Append als_a … als_z after the real tools (stdio + HTTP share TOOL_DEFS).
-TOOL_DEFS.extend(_letter_stub_tool_def(n) for n in LETTER_STUB_NAMES)
-
 
 def _tool_result(payload: dict[str, Any], *, is_error: bool = False) -> dict[str, Any]:
     text = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -441,8 +365,6 @@ def _tool_result(payload: dict[str, Any], *, is_error: bool = False) -> dict[str
 
 def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     args = arguments or {}
-    if name in LETTER_STUB_NAMES:
-        return _tool_result(letter_stub_payload(name, args))
 
     try:
         conn = open_db(db_path())
