@@ -389,28 +389,29 @@ cmd_install_desktop() {
   local exec_line status_line stop_line doctor_line
   case "$term" in
     gnome-terminal)
-      exec_line="gnome-terminal --title=ALS\\ Map\\ MCP -- $BIN_LINK watch"
-      status_line="gnome-terminal --title=ALS\\ Map\\ MCP\\ status -- bash -lc '$BIN_LINK status; echo; read -r -p \"Press Enter…\"'"
-      stop_line="gnome-terminal --title=ALS\\ Map\\ MCP\\ stop -- bash -lc '$BIN_LINK stop; echo; read -r -p \"Press Enter…\"'"
-      doctor_line="gnome-terminal --title=ALS\\ Map\\ MCP\\ doctor -- bash -lc '$BIN_LINK doctor; echo; read -r -p \"Press Enter…\"'"
+      # GLib KeyFile rejects `\ ` in Exec; use quoted titles. Keep `;` inside "…" for actions.
+      exec_line="gnome-terminal --title=\"ALS Map MCP\" -- $BIN_LINK watch"
+      status_line="gnome-terminal --title=\"ALS Map MCP status\" -- bash -c \"$BIN_LINK status; echo; read -r\""
+      stop_line="gnome-terminal --title=\"ALS Map MCP stop\" -- bash -c \"$BIN_LINK stop; echo; read -r\""
+      doctor_line="gnome-terminal --title=\"ALS Map MCP doctor\" -- bash -c \"$BIN_LINK doctor; echo; read -r\""
       ;;
     kgx)
-      exec_line="kgx --title=ALS\\ Map\\ MCP -e $BIN_LINK watch"
-      status_line="kgx --title=ALS\\ Map\\ MCP\\ status -e bash -lc '$BIN_LINK status; read -r'"
-      stop_line="kgx --title=ALS\\ Map\\ MCP\\ stop -e bash -lc '$BIN_LINK stop; read -r'"
-      doctor_line="kgx --title=ALS\\ Map\\ MCP\\ doctor -e bash -lc '$BIN_LINK doctor; read -r'"
+      exec_line="kgx --title=\"ALS Map MCP\" -e $BIN_LINK watch"
+      status_line="kgx --title=\"ALS Map MCP status\" -e bash -c \"$BIN_LINK status; read -r\""
+      stop_line="kgx --title=\"ALS Map MCP stop\" -e bash -c \"$BIN_LINK stop; read -r\""
+      doctor_line="kgx --title=\"ALS Map MCP doctor\" -e bash -c \"$BIN_LINK doctor; read -r\""
       ;;
     alacritty)
-      exec_line="alacritty --title ALS\\ Map\\ MCP -e $BIN_LINK watch"
-      status_line="alacritty --title ALS\\ Map\\ MCP\\ status -e bash -lc '$BIN_LINK status; read -r'"
-      stop_line="alacritty --title ALS\\ Map\\ MCP\\ stop -e bash -lc '$BIN_LINK stop; read -r'"
-      doctor_line="alacritty --title ALS\\ Map\\ MCP\\ doctor -e bash -lc '$BIN_LINK doctor; read -r'"
+      exec_line="alacritty --title \"ALS Map MCP\" -e $BIN_LINK watch"
+      status_line="alacritty --title \"ALS Map MCP status\" -e bash -c \"$BIN_LINK status; read -r\""
+      stop_line="alacritty --title \"ALS Map MCP stop\" -e bash -c \"$BIN_LINK stop; read -r\""
+      doctor_line="alacritty --title \"ALS Map MCP doctor\" -e bash -c \"$BIN_LINK doctor; read -r\""
       ;;
     xterm)
-      exec_line="xterm -T ALS\\ Map\\ MCP -e $BIN_LINK watch"
-      status_line="xterm -T ALS\\ Map\\ MCP\\ status -e bash -lc '$BIN_LINK status; read -r'"
-      stop_line="xterm -T ALS\\ Map\\ MCP\\ stop -e bash -lc '$BIN_LINK stop; read -r'"
-      doctor_line="xterm -T ALS\\ Map\\ MCP\\ doctor -e bash -lc '$BIN_LINK doctor; read -r'"
+      exec_line="xterm -T \"ALS Map MCP\" -e $BIN_LINK watch"
+      status_line="xterm -T \"ALS Map MCP status\" -e bash -c \"$BIN_LINK status; read -r\""
+      stop_line="xterm -T \"ALS Map MCP stop\" -e bash -c \"$BIN_LINK stop; read -r\""
+      doctor_line="xterm -T \"ALS Map MCP doctor\" -e bash -c \"$BIN_LINK doctor; read -r\""
       ;;
     *)
       # Fallback: let the desktop mark Terminal=true for visibility.
@@ -432,10 +433,11 @@ Name=ALS Map MCP
 GenericName=ALS Map MCP stack
 Comment=Start ALS Map MCP HTTP + Cloudflare tunnel and show live status
 Exec=$exec_line
+TryExec=$BIN_LINK
 Icon=$ICON_NAME
 Terminal=$terminal_flag
-Categories=Development;Utility;Network;
-Keywords=als;mcp;tunnel;cloudflare;
+Categories=Development;
+Keywords=als;mcp;tunnel;cloudflare;als map;
 StartupNotify=true
 Actions=Status;Stop;Doctor;
 
@@ -451,6 +453,21 @@ Exec=$stop_line
 Name=Doctor
 Exec=$doctor_line
 EOF
+  chmod +x "$DESKTOP_FILE"
+
+  local desktop_dir desktop_copy
+  desktop_dir="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+  [[ -z "$desktop_dir" ]] && desktop_dir="${HOME}/Desktop"
+  if [[ -d "$desktop_dir" ]]; then
+    desktop_copy="${desktop_dir}/als-map-mcp.desktop"
+    install -m 755 "$DESKTOP_FILE" "$desktop_copy"
+    # ding / GNOME desktop requires trusted + executable for a clickable launcher.
+    if command -v gio >/dev/null 2>&1; then
+      gio set "$desktop_copy" metadata::trusted true >/dev/null 2>&1 || true
+    fi
+  else
+    desktop_copy=""
+  fi
 
   if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "${HOME}/.local/share/applications" >/dev/null 2>&1 || true
@@ -461,12 +478,14 @@ EOF
 
   echo "Installed:"
   echo "  desktop  $DESKTOP_FILE"
+  [[ -n "$desktop_copy" ]] && echo "  Desktop  $desktop_copy"
   echo "  icon     $ICON_DST"
   echo "  bin      $BIN_LINK → $REPO_ROOT/scripts/als_map_stack"
   echo "  terminal $term"
   echo
-  echo "Pin on GNOME: open Activities → search “ALS Map MCP” → right-click → Pin to Dash"
-  echo "(or drag from the app grid onto the dash/favorites)."
+  echo "Find it: Activities → search “ALS Map MCP” (Name=ALS Map MCP)"
+  echo "Or: double-click ~/Desktop/als-map-mcp.desktop · or run: als_map_stack watch"
+  echo "Pin on GNOME: right-click the search hit → Pin to Dash (or drag onto favorites)."
 }
 
 main() {

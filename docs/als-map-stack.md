@@ -59,7 +59,9 @@ Client IP prefers `CF-Connecting-IP`, then `X-Forwarded-For`, else the socket pe
 ./scripts/als_map_stack install-desktop
 ```
 
-Then: **Activities → search “ALS Map MCP” → right-click → Pin to Dash** (or drag onto favorites).
+Then: **Activities → search “ALS Map MCP”** (`Name=ALS Map MCP`) → right-click → Pin to Dash (or drag onto favorites). `install-desktop` also drops an executable launcher on `~/Desktop/als-map-mcp.desktop`.
+
+Alternates: run `als_map_stack watch` from a terminal, or open `~/.local/share/applications/als-map-mcp.desktop`.
 
 The launcher opens a terminal (`gnome-terminal` preferred) running `als_map_stack watch`. Right-click actions: Status / Stop / Doctor.
 
