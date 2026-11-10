@@ -53,7 +53,7 @@ python scripts/als_map_mcp.py
 
 Optional: `ALS_MAP_DB=/path/to/als_map.sqlite`.
 
-### Cursor MCP config
+### Cursor MCP config (stdio / local)
 
 Add to Cursor MCP settings (path may vary by machine):
 
@@ -69,6 +69,86 @@ Add to Cursor MCP settings (path may vary by machine):
   }
 }
 ```
+
+## Remote MCP (Streamable HTTP)
+
+Same tools and caps over **Streamable HTTP** (`POST`/`GET` on `/mcp`), with **Bearer auth required**. Stdlib server — no FastAPI.
+
+```bash
+# generate a token (do not commit it)
+export ALS_MAP_MCP_TOKEN="$(openssl rand -hex 32)"
+# optional: ALS_MAP_MCP_HOST=127.0.0.1 ALS_MAP_MCP_PORT=8787 ALS_MAP_DB=…
+python scripts/als_map_mcp_http.py
+```
+
+- Default bind: `127.0.0.1:8787`
+- MCP endpoint: `http://127.0.0.1:8787/mcp`
+- Liveness (no auth): `http://127.0.0.1:8787/health`
+- Every `/mcp` request needs `Authorization: Bearer $ALS_MAP_MCP_TOKEN`
+
+### Curl smoke
+
+```bash
+# 401 without token
+curl -sS -o /tmp/als_mcp_401.json -w "%{http_code}\n" \
+  -X POST http://127.0.0.1:8787/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+
+# initialize + tools/list with token
+curl -sS http://127.0.0.1:8787/mcp \
+  -H "Authorization: Bearer $ALS_MAP_MCP_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+
+curl -sS http://127.0.0.1:8787/mcp \
+  -H "Authorization: Bearer $ALS_MAP_MCP_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+### Cloudflare Tunnel (DNS not ready)
+
+Example config: [`docs/cloudflare-tunnel.example.yml`](cloudflare-tunnel.example.yml).
+
+**`mcp.austenstrine.dev` does not exist yet — do not rely on that hostname.** When Austen is ready:
+
+1. Point the domain at Cloudflare (Namecheap nameservers or CNAME).
+2. `cloudflared tunnel create als-map-mcp` + `tunnel route dns … mcp.austenstrine.dev`.
+3. Ingress → `http://127.0.0.1:8787` while `als_map_mcp_http.py` runs locally (or on the self-hosted box).
+4. Keep `ALS_MAP_MCP_TOKEN` only in the environment / secret store — never in git.
+
+### Grok custom MCP (once hostname exists)
+
+Paste shape (URL + header). **Hostname is future — use localhost for now.**
+
+| Field | Value |
+|-------|-------|
+| URL | `https://mcp.austenstrine.dev/mcp` *(future)* / local: `http://127.0.0.1:8787/mcp` |
+| Header | `Authorization: Bearer <ALS_MAP_MCP_TOKEN>` |
+| Transport | Streamable HTTP (JSON responses supported) |
+
+### Cursor remote MCP snippet (once hostname exists)
+
+Cursor remote/custom MCP configs vary by build; typical shape:
+
+```json
+{
+  "mcpServers": {
+    "als-map-remote": {
+      "url": "https://mcp.austenstrine.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ALS_MAP_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Until DNS is live, keep using the **stdio** server above, or point `url` at `http://127.0.0.1:8787/mcp` on the same machine.
 
 ### Tools
 
@@ -102,4 +182,6 @@ Primary ongoing cost is **agent/Grok context tokens**, not index CPU.
 | `scripts/build_map_index.py` | JSONL → sqlite |
 | `scripts/map_query.py` | Debug CLI |
 | `scripts/als_map_mcp.py` | Stdio MCP server |
+| `scripts/als_map_mcp_http.py` | Streamable HTTP MCP + Bearer auth |
+| `docs/cloudflare-tunnel.example.yml` | Tunnel stub (DNS not ready) |
 | `data/index/` | Generated index (gitignored) |

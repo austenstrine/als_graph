@@ -30,9 +30,15 @@ python scripts/map_query.py stats
 
 # product: stdio MCP for Cursor
 python scripts/als_map_mcp.py
+
+# remote/custom MCP (Streamable HTTP; Bearer token required)
+export ALS_MAP_MCP_TOKEN="$(openssl rand -hex 32)"
+python scripts/als_map_mcp_http.py   # 127.0.0.1:8787/mcp
 ```
 
-Cursor MCP snippet:
+See [docs/map.md](docs/map.md) for curl smoke, Cloudflare tunnel stub, and Grok/Cursor remote paste shapes. **`mcp.austenstrine.dev` DNS is not ready yet.**
+
+Cursor MCP snippet (stdio):
 
 ```json
 {
@@ -57,8 +63,10 @@ Cursor MCP snippet:
 | `scripts/build_map_index.py` | JSONL → `data/index/als_map.sqlite` |
 | `scripts/map_query.py` | Debug CLI (not the product) |
 | `scripts/als_map_mcp.py` | Stdio MCP: search / get / thread / browse / stats |
+| `scripts/als_map_mcp_http.py` | Streamable HTTP MCP + Bearer auth |
 | `docs/normalization.md` | Schema + how to re-run normalizers |
-| `docs/map.md` | Map index, caps, MCP how-to |
+| `docs/map.md` | Map index, caps, MCP how-to (stdio + remote) |
+| `docs/cloudflare-tunnel.example.yml` | Cloudflare Tunnel stub (hostname future) |
 | `data/normalized/` | Generated JSONL (gitignored) |
 | `data/index/` | Generated sqlite index (gitignored) |
 | `10b2e090-…/export_data/…` | Raw Grok export (gitignored; read-only) |
