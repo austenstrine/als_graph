@@ -202,19 +202,7 @@ Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in
 | `als_contrast` | Two-slice compare (sources and/or time windows) with deltas on the same metrics |
 | `als_semantic_search` | Local embedding NN search; `query`; filters `source(s)?` / `role?` / `since?` / `until?`; limit ≤50 |
 | `als_thread_features` | Heuristic per-thread features (no LLM); `thread_id?` or filter/list (`source?` / length / refine / critique / density); limit ≤50 |
-| `als_gmail_search` | **Stub** — future Gmail FTS in this same map (`source=gmail`); **does nothing yet** |
-| `als_gmail_thread` | **Stub** — future Gmail conversation window; **does nothing yet** |
-| `als_gmail_labels` | **Stub** — future Gmail label list/counts; **does nothing yet** |
-| `als_gmail_get` | **Stub** — future one-message fetch; **does nothing yet** |
-| `als_gmail_attachments` | **Stub** — future attachment metadata; **does nothing yet** |
-| `als_drive_search` | **Stub** — future Drive search (`source=drive`); **does nothing yet** |
-| `als_drive_get` | **Stub** — future Drive file get; **does nothing yet** |
-| `als_calendar_events` | **Stub** — future Calendar browse (`source=calendar`); **does nothing yet** |
-| `als_contacts_lookup` | **Stub** — future Contacts lookup (`source=contacts`); **does nothing yet** |
-| `als_photos_search` | **Stub** — future Photos metadata search (`source=photos`); **does nothing yet** |
-| `als_photos_meta` | **Stub** — future one-photo metadata; **does nothing yet** |
-| `als_takeout_status` | **Stub** — future Takeout ingest status on this same index; **does nothing yet** |
-| `als_u` … `als_z` | Leftover letter expansion stubs (same map); **does nothing yet** |
+| `als_a` … `als_z` | Letter-slot stubs: self-describe purpose + how to interact; **this route does nothing yet** |
 
 Every hit includes cite fields: `id`, `source`, `created_at`, `url`, `thread_id`, `role`.
 
