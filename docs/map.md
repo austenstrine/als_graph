@@ -154,7 +154,7 @@ curl -sS http://127.0.0.1:8787/mcp \
 One command for HTTP MCP + Cloudflare tunnel (systemd user units), status panel, access log, desktop icon:
 
 ```bash
-scripts/als_map_stack start          # or: status | stop | restart | logs -f | doctor | watch
+scripts/als_map_stack start          # or: status | stop | restart | probe | logs -f | doctor | watch
 scripts/als_map_stack install-desktop
 ```
 
@@ -227,7 +227,7 @@ Primary ongoing cost is **agent/Grok context tokens**, not index CPU.
 | `scripts/map_query.py` | Debug CLI |
 | `scripts/als_map_mcp.py` | Stdio MCP server |
 | `scripts/als_map_mcp_http.py` | Streamable HTTP MCP + Bearer auth |
-| `scripts/als_map_stack` | One-command start/stop/status/logs/doctor + desktop launcher |
+| `scripts/als_map_stack` | One-command start/stop/status/probe/logs/doctor + desktop launcher |
 | `requirements-embed.txt` | Optional Phase 2′b venv deps |
 | `assets/als-map-mcp.svg` | Desktop icon for ALS Map MCP |
 | `docs/cloudflare-tunnel.example.yml` | Tunnel stub (DNS not ready) |

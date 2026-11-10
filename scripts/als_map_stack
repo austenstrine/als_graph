@@ -2,7 +2,7 @@
 # als_map_stack — one-command control plane for ALS Map MCP HTTP + Cloudflare tunnel.
 #
 # Usage:
-#   als_map_stack start|stop|restart|status|logs|doctor|watch|install-desktop
+#   als_map_stack start|stop|restart|status|logs|doctor|probe|watch|install-desktop
 #
 # Manages existing systemd --user units:
 #   als-map-mcp-http.service
@@ -57,10 +57,12 @@ Everyday:
   als_map_stack stop       # stop both units (easy off switch)
   als_map_stack restart    # reload units after code/branch changes
   als_map_stack status     # units, checkout, local+public health
+  als_map_stack probe      # human-readable tunnel MCP tool schema
 
 Also:
   logs [-f] [N]     Tail access log (default 50 lines; -f follow)
   doctor            Health checklist for required pieces
+  probe [--local] [--json]   Live tools/list schema (default: public tunnel)
   watch             Start (if needed) then refresh status + follow access log
   install-desktop   Install desktop entry + icon + ~/.local/bin symlink
 
@@ -330,6 +332,267 @@ cmd_doctor() {
   return 1
 }
 
+read_mcp_token() {
+  # Load bearer into stdout; never echo elsewhere. Empty if missing.
+  local token=""
+  if [[ -f "$TOKEN_FILE" ]]; then
+    token="$(tr -d ' \t\r\n' <"$TOKEN_FILE")"
+  fi
+  if [[ -z "$token" && -f "$ENV_FILE" ]]; then
+    token="$(
+      set -a
+      # shellcheck source=/dev/null
+      source "$ENV_FILE"
+      set +a
+      printf '%s' "${ALS_MAP_MCP_TOKEN:-}"
+    )"
+    token="$(printf '%s' "$token" | tr -d ' \t\r\n')"
+  fi
+  printf '%s' "$token"
+}
+
+cmd_probe() {
+  # Live MCP catalog via tunnel (default) or local HTTP. Token never printed.
+  local use_local=0 as_json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local|local) use_local=1; shift ;;
+      --public|public) use_local=0; shift ;;
+      --json|json) as_json=1; shift ;;
+      -h|--help|help)
+        cat <<EOF
+als_map_stack probe — live human-readable MCP tool schema
+
+  als_map_stack probe           # public tunnel (https://mcp.austenstrine.dev)
+  als_map_stack probe --local   # 127.0.0.1:8787
+  als_map_stack probe --json    # raw tools/list JSON (still no token printed)
+EOF
+        return 0
+        ;;
+      *)
+        echo "Unknown probe arg: $1" >&2
+        echo "Usage: als_map_stack probe [--local] [--json]" >&2
+        return 2
+        ;;
+    esac
+  done
+
+  local health_url mcp_url label
+  if [[ "$use_local" -eq 1 ]]; then
+    health_url="http://127.0.0.1:8787/health"
+    mcp_url="http://127.0.0.1:8787/mcp"
+    label="local"
+  else
+    health_url="$PUBLIC_HEALTH"
+    mcp_url="$PUBLIC_MCP"
+    label="tunnel"
+  fi
+
+  local token
+  token="$(read_mcp_token)"
+  if [[ -z "$token" ]]; then
+    echo "No MCP token at $TOKEN_FILE (or ALS_MAP_MCP_TOKEN in $ENV_FILE)." >&2
+    return 1
+  fi
+
+  local health_raw health_code health_body
+  health_raw="$(curl -sS -m 8 -w '\n%{http_code}' "$health_url" 2>/dev/null || true)"
+  if [[ -z "$health_raw" ]]; then
+    health_code="000"
+    health_body=""
+  else
+    health_code="$(printf '%s' "$health_raw" | tail -n1)"
+    health_body="$(printf '%s' "$health_raw" | sed '$d')"
+  fi
+
+  local tmp_hdr tmp_init tmp_list
+  tmp_hdr="$(mktemp)"
+  tmp_init="$(mktemp)"
+  tmp_list="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp_hdr' '$tmp_init' '$tmp_list'" RETURN
+
+  local init_code list_code sid=""
+  init_code="$(
+    curl -sS -m 20 -D "$tmp_hdr" -o "$tmp_init" -w '%{http_code}' \
+      -X POST "$mcp_url" \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Content-Type: application/json' \
+      -H 'Accept: application/json' \
+      -H 'MCP-Protocol-Version: 2025-03-26' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"als_map_stack-probe","version":"0"}}}' \
+      2>/dev/null || printf '000'
+  )"
+  # Portable: mawk lacks IGNORECASE.
+  sid="$(awk 'tolower($1)=="mcp-session-id:"{print $2; exit}' "$tmp_hdr" | tr -d '\r')"
+
+  if [[ -n "$sid" ]]; then
+    curl -sS -m 10 -o /dev/null -X POST "$mcp_url" \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Content-Type: application/json' \
+      -H 'Accept: application/json' \
+      -H 'MCP-Protocol-Version: 2025-03-26' \
+      -H "Mcp-Session-Id: ${sid}" \
+      -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+      >/dev/null 2>&1 || true
+  fi
+
+  local list_hdr
+  list_hdr="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp_hdr' '$tmp_init' '$tmp_list' '$list_hdr'" RETURN
+  if [[ -n "$sid" ]]; then
+    list_code="$(
+      curl -sS -m 30 -D "$list_hdr" -o "$tmp_list" -w '%{http_code}' \
+        -X POST "$mcp_url" \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json' \
+        -H 'MCP-Protocol-Version: 2025-03-26' \
+        -H "Mcp-Session-Id: ${sid}" \
+        -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+        2>/dev/null || printf '000'
+    )"
+  else
+    list_code="$(
+      curl -sS -m 30 -D "$list_hdr" -o "$tmp_list" -w '%{http_code}' \
+        -X POST "$mcp_url" \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json' \
+        -H 'MCP-Protocol-Version: 2025-03-26' \
+        -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+        2>/dev/null || printf '000'
+    )"
+  fi
+
+  if [[ "$as_json" -eq 1 ]]; then
+    if [[ "$list_code" != "200" ]]; then
+      echo "tools/list failed: HTTP $list_code (initialize HTTP $init_code)" >&2
+      return 1
+    fi
+    cat "$tmp_list"
+    echo
+    return 0
+  fi
+
+  echo
+  bold "ALS Map MCP probe"
+  echo
+  echo "  $(dim "target")   $label"
+  echo "  $(dim "mcp")      $mcp_url"
+  echo "  $(dim "health")   $health_url  →  $(
+    if [[ "$health_code" == 200 ]]; then ok; else bad; fi
+  ) $health_code"
+  if [[ "$health_code" == 200 && -n "$health_body" ]]; then
+    echo "  $(dim "server")   $(printf '%s' "$health_body" | tr '\n' ' ' | cut -c1-160)"
+  fi
+  echo "  $(dim "init")     HTTP $init_code$( [[ -n "$sid" ]] && printf '  session=yes' || printf '  session=no' )"
+  echo "  $(dim "list")     HTTP $list_code"
+  echo
+  bold "HTTP surface"
+  echo
+  echo "  GET  /health   no auth — liveness + server version JSON"
+  echo "  POST /mcp      Bearer required — MCP JSON-RPC (initialize, tools/list, tools/call, …)"
+  echo "  GET  /mcp      Bearer + Accept: text/event-stream — optional short SSE"
+  echo
+
+  if [[ "$list_code" != "200" ]]; then
+    bold "Tools"
+    echo
+    echo "  $(bad) tools/list failed (HTTP $list_code). Is the stack up? Try: als_map_stack status"
+    if [[ -s "$tmp_list" ]]; then
+      echo "  $(dim "$(head -c 240 "$tmp_list" | tr '\n' ' ')")"
+    fi
+    echo
+    return 1
+  fi
+
+  ALS_MAP_PROBE_INIT="$tmp_init" ALS_MAP_PROBE_LIST="$tmp_list" python3 - <<'PY'
+import json, os, textwrap
+
+def type_str(schema):
+    if not isinstance(schema, dict):
+        return str(schema)
+    t = schema.get("type")
+    if isinstance(t, list):
+        t = "|".join(str(x) for x in t)
+    enum = schema.get("enum")
+    if enum is not None:
+        vals = ", ".join(json.dumps(v, ensure_ascii=False) for v in enum)
+        return f"{t or 'enum'} {{{vals}}}"
+    if t == "array":
+        items = schema.get("items") or {}
+        return f"array[{type_str(items) if isinstance(items, dict) else items}]"
+    if t == "object" and "properties" in schema:
+        return "object"
+    extra = []
+    if "minimum" in schema:
+        extra.append(f">={schema['minimum']}")
+    if "maximum" in schema:
+        extra.append(f"<={schema['maximum']}")
+    if "minLength" in schema:
+        extra.append(f"len>={schema['minLength']}")
+    if "maxLength" in schema:
+        extra.append(f"len<={schema['maxLength']}")
+    base = t or "any"
+    return f"{base} ({', '.join(map(str, extra))})" if extra else str(base)
+
+init_path = os.environ["ALS_MAP_PROBE_INIT"]
+list_path = os.environ["ALS_MAP_PROBE_LIST"]
+try:
+    init = json.load(open(init_path, encoding="utf-8"))
+except Exception as exc:
+    init = {"_error": str(exc)}
+try:
+    listing = json.load(open(list_path, encoding="utf-8"))
+except Exception as exc:
+    print(f"Tools\n\n  FAIL parse tools/list: {exc}")
+    raise SystemExit(1)
+
+server = (init.get("result") or {}).get("serverInfo") or {}
+tools = (listing.get("result") or {}).get("tools") or []
+ver = server.get("version") or "?"
+name = server.get("name") or "als-map"
+print("Tools")
+print()
+print(f"  {name} {ver} — {len(tools)} tool(s)")
+print()
+for tool in tools:
+    n = tool.get("name") or "?"
+    desc = (tool.get("description") or "").strip().replace("\n", " ")
+    print(f"  {n}")
+    if desc:
+        for line in textwrap.wrap(desc, width=88, initial_indent="    ", subsequent_indent="    "):
+            print(line)
+    schema = tool.get("inputSchema") or {}
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    if not props:
+        print("    args: (none / empty object)")
+        print()
+        continue
+    print("    args:")
+    for key, prop in props.items():
+        if not isinstance(prop, dict):
+            prop = {}
+        mark = "" if key in required else "?"
+        typ = type_str(prop)
+        pdesc = (prop.get("description") or "").strip().replace("\n", " ")
+        line = f"      {key}{mark}: {typ}"
+        if pdesc:
+            line += f" — {pdesc}"
+        # keep one line readable
+        if len(line) > 100:
+            print(f"      {key}{mark}: {typ}")
+            for wl in textwrap.wrap(pdesc, width=84, initial_indent="        ", subsequent_indent="        "):
+                print(wl)
+        else:
+            print(line)
+    print()
+PY
+}
+
 detect_terminal() {
   if command -v gnome-terminal >/dev/null 2>&1; then
     echo gnome-terminal
@@ -418,7 +681,7 @@ PY
 
   local term
   term="$(detect_terminal)"
-  local exec_line status_line stop_line doctor_line
+  local exec_line status_line stop_line doctor_line probe_line
   case "$term" in
     gnome-terminal)
       # GLib KeyFile rejects `\ ` in Exec; use quoted titles. Keep `;` inside "…" for actions.
@@ -426,24 +689,28 @@ PY
       status_line="gnome-terminal --title=\"ALS Map MCP status\" -- bash -c \"$BIN_LINK status; echo; read -r\""
       stop_line="gnome-terminal --title=\"ALS Map MCP stop\" -- bash -c \"$BIN_LINK stop; echo; read -r\""
       doctor_line="gnome-terminal --title=\"ALS Map MCP doctor\" -- bash -c \"$BIN_LINK doctor; echo; read -r\""
+      probe_line="gnome-terminal --title=\"ALS Map MCP probe\" -- bash -c \"$BIN_LINK probe; echo; read -r\""
       ;;
     kgx)
       exec_line="kgx --title=\"ALS Map MCP\" -e $BIN_LINK watch"
       status_line="kgx --title=\"ALS Map MCP status\" -e bash -c \"$BIN_LINK status; read -r\""
       stop_line="kgx --title=\"ALS Map MCP stop\" -e bash -c \"$BIN_LINK stop; read -r\""
       doctor_line="kgx --title=\"ALS Map MCP doctor\" -e bash -c \"$BIN_LINK doctor; read -r\""
+      probe_line="kgx --title=\"ALS Map MCP probe\" -e bash -c \"$BIN_LINK probe; read -r\""
       ;;
     alacritty)
       exec_line="alacritty --title \"ALS Map MCP\" -e $BIN_LINK watch"
       status_line="alacritty --title \"ALS Map MCP status\" -e bash -c \"$BIN_LINK status; read -r\""
       stop_line="alacritty --title \"ALS Map MCP stop\" -e bash -c \"$BIN_LINK stop; read -r\""
       doctor_line="alacritty --title \"ALS Map MCP doctor\" -e bash -c \"$BIN_LINK doctor; read -r\""
+      probe_line="alacritty --title \"ALS Map MCP probe\" -e bash -c \"$BIN_LINK probe; read -r\""
       ;;
     xterm)
       exec_line="xterm -T \"ALS Map MCP\" -e $BIN_LINK watch"
       status_line="xterm -T \"ALS Map MCP status\" -e bash -c \"$BIN_LINK status; read -r\""
       stop_line="xterm -T \"ALS Map MCP stop\" -e bash -c \"$BIN_LINK stop; read -r\""
       doctor_line="xterm -T \"ALS Map MCP doctor\" -e bash -c \"$BIN_LINK doctor; read -r\""
+      probe_line="xterm -T \"ALS Map MCP probe\" -e bash -c \"$BIN_LINK probe; read -r\""
       ;;
     *)
       # Fallback: let the desktop mark Terminal=true for visibility.
@@ -451,6 +718,7 @@ PY
       status_line="$BIN_LINK status"
       stop_line="$BIN_LINK stop"
       doctor_line="$BIN_LINK doctor"
+      probe_line="$BIN_LINK probe"
       ;;
   esac
 
@@ -471,7 +739,7 @@ Terminal=$terminal_flag
 Categories=Development;
 Keywords=als;mcp;tunnel;cloudflare;als map;
 StartupNotify=true
-Actions=Status;Stop;Doctor;
+Actions=Status;Stop;Doctor;Probe;
 
 [Desktop Action Status]
 Name=Status panel
@@ -484,6 +752,10 @@ Exec=$stop_line
 [Desktop Action Doctor]
 Name=Doctor
 Exec=$doctor_line
+
+[Desktop Action Probe]
+Name=Probe tools
+Exec=$probe_line
 EOF
   chmod +x "$DESKTOP_FILE"
 
@@ -531,6 +803,7 @@ main() {
     status) cmd_status "$@" ;;
     logs) cmd_logs "$@" ;;
     doctor) cmd_doctor "$@" ;;
+    probe|schema|tools) cmd_probe "$@" ;;
     watch) cmd_watch "$@" ;;
     install-desktop|install) cmd_install_desktop "$@" ;;
     *)

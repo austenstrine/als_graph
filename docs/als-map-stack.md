@@ -10,6 +10,7 @@ als_map_stack start      # bring HTTP MCP + tunnel up
 als_map_stack stop       # easy off switch (both units)
 als_map_stack restart    # required after code/branch changes
 als_map_stack status      # units, git checkout, local+public health
+als_map_stack probe      # human-readable live tool schema (tunnel)
 als_map_stack logs -f
 als_map_stack doctor
 als_map_stack install-desktop   # desktop icon + PATH symlink
@@ -36,6 +37,7 @@ Public: `https://mcp.austenstrine.dev/mcp` — health `…/health`.
 | `stop` | Stop tunnel then HTTP MCP (easy full off) |
 | `restart` | `daemon-reload` + restart both units; reloads code from the current checkout |
 | `status` | Units, **git branch/HEAD**, local+public `/health`, recent access + journal |
+| `probe [--local] [--json]` | Live Bearer `tools/list` via tunnel (or `--local`); human-readable tool + arg schema (aliases: `schema`, `tools`) |
 | `logs [-f] [N]` | Tail access log (`-f` follow) |
 | `doctor` | Checklist: scripts, token, units, cloudflared, health endpoints |
 | `watch` | Start if needed, print status, follow access log + periodic health line |
@@ -76,7 +78,7 @@ Then: **Activities → search “ALS Map MCP”** (`Name=ALS Map MCP`) → right
 
 Alternates: run `als_map_stack watch` from a terminal, or open `~/.local/share/applications/als-map-mcp.desktop`.
 
-The launcher opens a terminal (`gnome-terminal` preferred) running `als_map_stack watch`. Right-click actions: Status / Stop / Doctor.
+The launcher opens a terminal (`gnome-terminal` preferred) running `als_map_stack watch`. Right-click actions: Status / Stop / Doctor / Probe.
 
 Icon: circular AS logo (`assets/als-map-mcp.png` + scalable `assets/als-map-mcp.svg`), from `~/Pictures/AS_LOGO`.
 
