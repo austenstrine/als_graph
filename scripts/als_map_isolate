@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# als_map_isolate — run ALS Map smoke/tests under a constrained systemd --user scope.
+#
+# Preference: cgroup isolation (MemoryMax/TasksMax/OOMScoreAdjust/nice/ionice)
+# over query throttling. No CPUQuota. No sleep/backoff that slows search.
+#
+# Safety (Raider GUI crash lesson):
+#   NEVER kill user systemd, session dbus, or hung systemctl --user children.
+#   If the user bus is wedged, fail soft with a clear message.
+#
+# Usage:
+#   als_map_isolate run [--profile smoke] -- <command>...
+#   als_map_isolate install-units   # copy templates → ~/.config/systemd/user + safe reload
+#   als_map_isolate doctor
+#   als_map_isolate status
+#   als_map_isolate profiles
+set -euo pipefail
+
+_SCRIPT_PATH="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  _RESOLVED="$(readlink -f "$_SCRIPT_PATH" 2>/dev/null || true)"
+  [[ -n "$_RESOLVED" ]] && _SCRIPT_PATH="$_RESOLVED"
+fi
+REPO_ROOT="$(cd "$(dirname "$_SCRIPT_PATH")/.." && pwd)"
+unset _SCRIPT_PATH _RESOLVED
+
+# shellcheck source=als_map_systemd.sh
+source "${REPO_ROOT}/scripts/als_map_systemd.sh"
+
+USER_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+REPO_UNIT_DIR="${REPO_ROOT}/systemd/user"
+SLICE_NAME="als-map-agent.slice"
+
+# Default smoke profile — tight enough to protect a gaming-laptop desktop session
+# while still allowing MiniLM-backed index smoke. Override via env if needed.
+SMOKE_MEMORY_MAX="${ALS_MAP_SMOKE_MEMORY_MAX:-4G}"
+SMOKE_TASKS_MAX="${ALS_MAP_SMOKE_TASKS_MAX:-256}"
+SMOKE_OOM_SCORE="${ALS_MAP_SMOKE_OOM_SCORE:-700}"
+SMOKE_NICE="${ALS_MAP_SMOKE_NICE:-10}"
+SMOKE_IO_CLASS="${ALS_MAP_SMOKE_IO_CLASS:-best-effort}"
+SMOKE_IO_PRIO="${ALS_MAP_SMOKE_IO_PRIO:-6}"
+
+bold() { printf '\033[1m%s\033[0m' "$*"; }
+dim() { printf '\033[2m%s\033[0m' "$*"; }
+green() { printf '\033[32m%s\033[0m' "$*"; }
+red() { printf '\033[31m%s\033[0m' "$*"; }
+yellow() { printf '\033[33m%s\033[0m' "$*"; }
+ok() { green "ok"; }
+bad() { red "FAIL"; }
+warn() { yellow "warn"; }
+
+usage() {
+  cat <<EOF
+als_map_isolate — constrained scopes for ALS Map smoke/tests
+
+  als_map_isolate run [--profile smoke] -- <command>...
+  als_map_isolate install-units   # install slice + MCP unit templates (safe reload)
+  als_map_isolate doctor
+  als_map_isolate status
+  als_map_isolate profiles
+
+Smoke scopes land in ${SLICE_NAME} with MemoryMax/TasksMax/OOMScoreAdjust/Nice/IO*.
+MCP unit templates ship MemoryMax/TasksMax/OOMScoreAdjust ceilings only.
+No CPUQuota. No query-tool sleep/backoff.
+
+If user systemd is wedged, commands fail soft — they never kill systemd --user,
+session dbus, or hung systemctl processes.
+
+Env overrides (smoke profile):
+  ALS_MAP_SMOKE_MEMORY_MAX   default ${SMOKE_MEMORY_MAX}
+  ALS_MAP_SMOKE_TASKS_MAX    default ${SMOKE_TASKS_MAX}
+  ALS_MAP_SMOKE_OOM_SCORE    default ${SMOKE_OOM_SCORE}
+  ALS_MAP_SMOKE_NICE         default ${SMOKE_NICE}
+  ALS_MAP_SMOKE_IO_CLASS     default ${SMOKE_IO_CLASS}
+  ALS_MAP_SMOKE_IO_PRIO      default ${SMOKE_IO_PRIO}
+EOF
+}
+
+cmd_profiles() {
+  cat <<EOF
+Profiles (smoke only — MCP uses unit MemoryMax/TasksMax, not this runner)
+
+  smoke (default)
+    Slice:            ${SLICE_NAME}
+    MemoryMax:        ${SMOKE_MEMORY_MAX}   (scope; slice aggregate 6G)
+    TasksMax:         ${SMOKE_TASKS_MAX}
+    OOMScoreAdjust:   ${SMOKE_OOM_SCORE}    (prefer kill smoke before GUI)
+    Nice:             ${SMOKE_NICE}
+    IOScheduling:     class=${SMOKE_IO_CLASS} priority=${SMOKE_IO_PRIO}
+    CPUQuota:         none
+
+MCP HTTP template ceilings (systemd/user/als-map-mcp-http.service)
+    MemoryMax=8G  TasksMax=128  OOMScoreAdjust=200  (no CPUQuota)
+
+MCP tunnel template ceilings (systemd/user/als-map-mcp-tunnel.service)
+    MemoryMax=256M  TasksMax=32  OOMScoreAdjust=100  (no CPUQuota)
+EOF
+}
+
+require_user_bus() {
+  if ! als_user_bus_ok; then
+    als_user_systemd_fail_msg
+    return 75
+  fi
+  return 0
+}
+
+cmd_install_units() {
+  # Install agent slice + MCP *limit drop-ins* (does not clobber live ExecStart).
+  # Does NOT restart live MCP units (host apply deferred). Never kills anything.
+  local force_mcp_units=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force-mcp-units) force_mcp_units=1; shift ;;
+      -h|--help)
+        cat <<EOF
+als_map_isolate install-units [--force-mcp-units]
+
+  Installs als-map-agent.slice and MCP MemoryMax/TasksMax/OOMScoreAdjust
+  drop-ins under ~/.config/systemd/user/*.service.d/limits.conf.
+  Full MCP unit templates stay in systemd/user/ for reference / fresh hosts.
+  --force-mcp-units also copies the full .service templates (overwrites).
+  Never restarts MCP; never kills user systemd on failure.
+EOF
+        return 0
+        ;;
+      *) echo "Unknown install-units arg: $1" >&2; return 2 ;;
+    esac
+  done
+
+  require_user_bus || return 75
+
+  mkdir -p "$USER_UNIT_DIR"
+  local copied=0
+
+  if [[ ! -f "${REPO_UNIT_DIR}/${SLICE_NAME}" ]]; then
+    echo "Missing template: ${REPO_UNIT_DIR}/${SLICE_NAME}" >&2
+    return 1
+  fi
+  install -m 644 "${REPO_UNIT_DIR}/${SLICE_NAME}" "${USER_UNIT_DIR}/${SLICE_NAME}"
+  echo "Installed ${USER_UNIT_DIR}/${SLICE_NAME}"
+  copied=$((copied + 1))
+
+  # MCP ceilings as drop-ins so live WorkingDirectory/ExecStart stay intact.
+  local svc drop_dir drop_file
+  for svc in als-map-mcp-http.service als-map-mcp-tunnel.service; do
+    drop_dir="${USER_UNIT_DIR}/${svc}.d"
+    drop_file="${drop_dir}/limits.conf"
+    mkdir -p "$drop_dir"
+    case "$svc" in
+      als-map-mcp-http.service)
+        cat >"$drop_file" <<'EOF'
+# Managed by als_map_isolate install-units — resource ceilings only.
+# No CPUQuota (keep ALS Map search snappy). Restart MCP to apply.
+[Service]
+MemoryMax=8G
+TasksMax=128
+OOMScoreAdjust=200
+EOF
+        ;;
+      als-map-mcp-tunnel.service)
+        cat >"$drop_file" <<'EOF'
+# Managed by als_map_isolate install-units — resource ceilings only.
+# No CPUQuota. Restart tunnel to apply.
+[Service]
+MemoryMax=256M
+TasksMax=32
+OOMScoreAdjust=100
+EOF
+        ;;
+    esac
+    echo "Installed ${drop_file}"
+    copied=$((copied + 1))
+
+    if [[ "$force_mcp_units" -eq 1 ]]; then
+      if [[ ! -f "${REPO_UNIT_DIR}/${svc}" ]]; then
+        echo "Missing template: ${REPO_UNIT_DIR}/${svc}" >&2
+        return 1
+      fi
+      install -m 644 "${REPO_UNIT_DIR}/${svc}" "${USER_UNIT_DIR}/${svc}"
+      echo "Installed ${USER_UNIT_DIR}/${svc} (--force-mcp-units)"
+      copied=$((copied + 1))
+    fi
+  done
+
+  if ! als_user_systemctl daemon-reload; then
+    echo "als_map_isolate: daemon-reload failed or timed out — files written but not loaded." >&2
+    echo "als_map_isolate: do NOT kill systemctl/systemd --user; re-login when the session is healthy." >&2
+    return 75
+  fi
+
+  # Enable the slice so transient scopes can attach; do not touch MCP start here.
+  if ! als_user_systemctl enable "$SLICE_NAME"; then
+    echo "als_map_isolate: enable ${SLICE_NAME} failed (bus ok but enable error)." >&2
+    return 1
+  fi
+  # Start slice (empty parent); safe — not a stack restart.
+  if ! als_user_systemctl start "$SLICE_NAME"; then
+    echo "als_map_isolate: start ${SLICE_NAME} failed." >&2
+    return 1
+  fi
+
+  echo
+  echo "Installed/updated ${copied} file(s) under ${USER_UNIT_DIR}"
+  echo "Slice ${SLICE_NAME} enabled+started."
+  echo "MCP units were NOT restarted (host apply deferred — use als_map_stack restart only when desktop is stable)."
+}
+
+cmd_status() {
+  echo
+  bold "als_map_isolate status"
+  echo
+  if als_user_bus_ok; then
+    echo "  $(dim "user bus")  $(ok) responsive"
+  else
+    echo "  $(dim "user bus")  $(bad) wedged / unreachable"
+    als_user_systemd_fail_msg
+    return 75
+  fi
+
+  local slice_state
+  slice_state="$(als_user_systemctl is-active "$SLICE_NAME" 2>/dev/null || echo inactive)"
+  printf '  %-28s %s\n' "$SLICE_NAME" "$slice_state"
+
+  local u
+  for u in als-map-mcp-http.service als-map-mcp-tunnel.service; do
+    local st en
+    st="$(als_user_systemctl is-active "$u" 2>/dev/null || echo inactive)"
+    en="$(als_user_systemctl is-enabled "$u" 2>/dev/null || echo disabled)"
+    printf '  %-28s active=%-10s enabled=%s\n' "$u" "$st" "$en"
+  done
+
+  echo
+  echo "  $(dim "templates") ${REPO_UNIT_DIR}"
+  echo "  $(dim "user dir")  ${USER_UNIT_DIR}"
+  echo
+}
+
+cmd_doctor() {
+  local fail=0
+  echo
+  bold "als_map_isolate doctor"
+  echo
+
+  check() {
+    local name="$1" okish="$2" detail="$3"
+    if [[ "$okish" == 1 ]]; then
+      printf '  [%s] %s — %s\n' "$(ok)" "$name" "$detail"
+    else
+      printf '  [%s] %s — %s\n' "$(bad)" "$name" "$detail"
+      fail=1
+    fi
+  }
+
+  [[ -f "${REPO_ROOT}/scripts/als_map_systemd.sh" ]] \
+    && check "systemd helpers" 1 "scripts/als_map_systemd.sh" \
+    || check "systemd helpers" 0 "missing"
+
+  [[ -x "${REPO_ROOT}/scripts/als_map_isolate" ]] \
+    && check "isolate +x" 1 "scripts/als_map_isolate" \
+    || check "isolate +x" 0 "not executable in checkout"
+
+  local f
+  for f in als-map-agent.slice als-map-mcp-http.service als-map-mcp-tunnel.service; do
+    [[ -f "${REPO_UNIT_DIR}/${f}" ]] \
+      && check "template $f" 1 "${REPO_UNIT_DIR}/${f}" \
+      || check "template $f" 0 "missing"
+  done
+
+  if als_user_bus_ok; then
+    check "user bus" 1 "responsive"
+    [[ -f "${USER_UNIT_DIR}/${SLICE_NAME}" ]] \
+      && check "installed slice" 1 "${USER_UNIT_DIR}/${SLICE_NAME}" \
+      || check "installed slice" 0 "run: als_map_isolate install-units"
+    # Presence of CPUQuota in templates would violate preference — lint.
+    if grep -R --line-number -E '^[[:space:]]*CPUQuota=' "$REPO_UNIT_DIR" >/dev/null 2>&1; then
+      check "no CPUQuota" 0 "CPUQuota found in systemd/user templates"
+    else
+      check "no CPUQuota" 1 "templates clean"
+    fi
+  else
+    check "user bus" 0 "wedged — fail soft; do not kill systemd --user"
+  fi
+
+  command -v systemd-run >/dev/null \
+    && check "systemd-run" 1 "$(command -v systemd-run)" \
+    || check "systemd-run" 0 "not on PATH"
+
+  echo
+  if [[ "$fail" -eq 0 ]]; then
+    echo "Doctor: all checks passed."
+    return 0
+  fi
+  echo "Doctor: one or more checks failed."
+  return 1
+}
+
+cmd_run() {
+  local profile="smoke"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile)
+        profile="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -h|--help|help)
+        usage
+        return 0
+        ;;
+      *)
+        # Allow: als_map_isolate run cmd... without --
+        break
+        ;;
+    esac
+  done
+
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: als_map_isolate run [--profile smoke] -- <command>..." >&2
+    return 2
+  fi
+
+  if [[ "$profile" != "smoke" ]]; then
+    echo "Unknown profile: $profile (only 'smoke' is defined; MCP uses unit ceilings)." >&2
+    return 2
+  fi
+
+  require_user_bus || return 75
+
+  if ! command -v systemd-run >/dev/null 2>&1; then
+    echo "als_map_isolate: systemd-run not found; cannot create isolated scope." >&2
+    return 1
+  fi
+
+  # Ensure slice unit is available (installed). Do not auto-overwrite live MCP units here.
+  if [[ ! -f "${USER_UNIT_DIR}/${SLICE_NAME}" ]]; then
+    echo "als_map_isolate: ${SLICE_NAME} not installed under ${USER_UNIT_DIR}." >&2
+    echo "als_map_isolate: run: ${REPO_ROOT}/scripts/als_map_isolate install-units" >&2
+    return 1
+  fi
+
+  # Make sure slice is active (empty parent). Fail soft on timeout — never kill.
+  local slice_a
+  slice_a="$(als_user_systemctl is-active "$SLICE_NAME" 2>/dev/null || echo inactive)"
+  if [[ "$slice_a" != active ]]; then
+    als_user_systemctl start "$SLICE_NAME" || {
+      echo "als_map_isolate: could not start ${SLICE_NAME}; refusing unconstrained run." >&2
+      return 75
+    }
+  fi
+
+  local unit_name
+  unit_name="als-map-smoke-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
+  echo "als_map_isolate: scope=${unit_name}.scope slice=${SLICE_NAME}" \
+    "MemoryMax=${SMOKE_MEMORY_MAX} TasksMax=${SMOKE_TASKS_MAX}" \
+    "OOMScoreAdjust=${SMOKE_OOM_SCORE} Nice=${SMOKE_NICE}" \
+    "IO=${SMOKE_IO_CLASS}:${SMOKE_IO_PRIO} (no CPUQuota)"
+
+  # Transient scope: dies with the command. --collect cleans the unit afterward.
+  # Property flags only — no CPUQuota.
+  local rc=0
+  # Properties only (portable). No CPUQuota. --collect drops the scope unit after exit.
+  systemd-run --user --scope \
+    --unit="$unit_name" \
+    --slice="$SLICE_NAME" \
+    --collect \
+    -p "Nice=${SMOKE_NICE}" \
+    -p "MemoryMax=${SMOKE_MEMORY_MAX}" \
+    -p "TasksMax=${SMOKE_TASKS_MAX}" \
+    -p "OOMScoreAdjust=${SMOKE_OOM_SCORE}" \
+    -p "IOSchedulingClass=${SMOKE_IO_CLASS}" \
+    -p "IOSchedulingPriority=${SMOKE_IO_PRIO}" \
+    -- "$@" || rc=$?
+
+  if [[ "$rc" -ne 0 ]]; then
+    # If the failure looks like a wedged bus mid-run, print the soft-fail guidance.
+    echo "als_map_isolate: command exited ${rc}" >&2
+  fi
+  return "$rc"
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    ""|-h|--help|help) usage ;;
+    run) cmd_run "$@" ;;
+    install-units|install) cmd_install_units "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    status) cmd_status "$@" ;;
+    profiles|limits) cmd_profiles "$@" ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

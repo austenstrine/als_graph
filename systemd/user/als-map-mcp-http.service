@@ -1,0 +1,24 @@
+[Unit]
+Description=ALS Map MCP HTTP (loopback :8787)
+Documentation=man:systemd.resource-control(5)
+After=network.target
+# Template shipped in-repo. Install via: scripts/als_map_isolate install-units
+# Live apply/restart on Raider is deferred until the desktop session is stable.
+# Ceilings only — no CPUQuota / no query-tool sleep-backoff.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Development/als_graph
+EnvironmentFile=-%h/.config/als_map/env
+Environment=ALS_MAP_ACCESS_LOG=%h/.local/state/als_map/access.log
+ExecStart=%h/Development/als_graph/.venv/bin/python %h/Development/als_graph/scripts/als_map_mcp_http.py
+Restart=on-failure
+RestartSec=2
+
+# Resource ceilings (protect GUI; leave CPU uncapped for snappy search)
+MemoryMax=8G
+TasksMax=128
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=default.target

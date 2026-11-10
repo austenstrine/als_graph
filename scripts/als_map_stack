@@ -20,6 +20,11 @@ if command -v readlink >/dev/null 2>&1; then
 fi
 REPO_ROOT="$(cd "$(dirname "$_SCRIPT_PATH")/.." && pwd)"
 unset _SCRIPT_PATH _RESOLVED
+
+# Safe systemd --user helpers: fail soft on wedged bus; never kill user systemd/dbus.
+# shellcheck source=als_map_systemd.sh
+source "${REPO_ROOT}/scripts/als_map_systemd.sh"
+
 HTTP_UNIT="als-map-mcp-http.service"
 TUNNEL_UNIT="als-map-mcp-tunnel.service"
 CONFIG_DIR="${HOME}/.config/als_map"
@@ -72,6 +77,12 @@ so Grok / tools/list pick up the new code (live process does not auto-reload).
 
 Env:
   ALS_MAP_ACCESS_LOG  override access log path
+
+Safety:
+  start/stop/restart/daemon-reload use timed systemctl --user calls.
+  If the user bus is wedged (Transport endpoint is not connected), commands
+  fail soft and NEVER kill systemd --user, session dbus, or hung systemctl.
+  Smoke/tests: scripts/als_map_isolate (cgroup MemoryMax/TasksMax; no CPUQuota).
 EOF
 }
 
@@ -162,11 +173,28 @@ ensure_write_token() {
 }
 
 unit_state() {
-  systemctl --user is-active "$1" 2>/dev/null || echo "inactive"
+  # Read-only probe: if bus is wedged, surface that instead of hanging.
+  if ! als_user_bus_ok; then
+    echo "bus-wedged"
+    return 0
+  fi
+  als_user_systemctl is-active "$1" 2>/dev/null || echo "inactive"
 }
 
 unit_enabled() {
-  systemctl --user is-enabled "$1" 2>/dev/null || echo "disabled"
+  if ! als_user_bus_ok; then
+    echo "bus-wedged"
+    return 0
+  fi
+  als_user_systemctl is-enabled "$1" 2>/dev/null || echo "disabled"
+}
+
+require_user_bus_or_fail() {
+  if ! als_user_bus_ok; then
+    als_user_systemd_fail_msg
+    return 75
+  fi
+  return 0
 }
 
 http_probe() {
@@ -199,9 +227,10 @@ fmt_probe() {
 }
 
 cmd_start() {
+  require_user_bus_or_fail || return 75
   ensure_token
-  systemctl --user daemon-reload
-  systemctl --user enable --now "$HTTP_UNIT" "$TUNNEL_UNIT" >/dev/null
+  als_user_systemctl daemon-reload || return 75
+  als_user_systemctl enable --now "$HTTP_UNIT" "$TUNNEL_UNIT" >/dev/null || return $?
   # Brief settle so /health is ready for the panel.
   sleep 0.6
   echo "Started $HTTP_UNIT + $TUNNEL_UNIT"
@@ -209,15 +238,27 @@ cmd_start() {
 }
 
 cmd_stop() {
-  systemctl --user stop "$TUNNEL_UNIT" "$HTTP_UNIT" || true
+  if ! als_user_bus_ok; then
+    als_user_systemd_fail_msg
+    echo "als_map_stack stop: skipped — user bus wedged (units may still be running)." >&2
+    return 75
+  fi
+  als_user_systemctl stop "$TUNNEL_UNIT" "$HTTP_UNIT" || true
   echo "Stopped ALS Map MCP stack ($HTTP_UNIT + $TUNNEL_UNIT)"
   cmd_status
 }
 
 cmd_restart() {
+  # Critical path: a hung restart must fail soft — never kill systemctl/systemd --user.
+  require_user_bus_or_fail || return 75
   ensure_token
-  systemctl --user daemon-reload
-  systemctl --user restart "$HTTP_UNIT" "$TUNNEL_UNIT"
+  als_user_systemctl daemon-reload || return 75
+  als_user_systemctl restart "$HTTP_UNIT" "$TUNNEL_UNIT" || {
+    local rc=$?
+    echo "als_map_stack restart: systemctl failed (exit $rc)." >&2
+    echo "als_map_stack: do NOT kill hung systemctl --user / systemd --user / session dbus." >&2
+    return "$rc"
+  }
   sleep 0.8
   echo "Restarted ALS Map MCP stack ($HTTP_UNIT + $TUNNEL_UNIT) — code reloaded from $REPO_ROOT"
   cmd_status
@@ -256,6 +297,9 @@ cmd_status() {
   echo
   bold "Units"
   echo
+  if [[ "$http_a" == bus-wedged || "$tun_a" == bus-wedged ]]; then
+    printf '  %s user systemd bus wedged — status unknown; do NOT kill systemd --user\n' "$(bad)"
+  fi
   printf '  %-28s active=%-8s enabled=%s\n' "$HTTP_UNIT" \
     "$( [[ "$http_a" == active ]] && ok || bad ) $http_a" "$http_e"
   printf '  %-28s active=%-8s enabled=%s\n' "$TUNNEL_UNIT" \
@@ -274,10 +318,14 @@ cmd_status() {
   echo
   bold "Unit journal (last 3 each)"
   echo
-  echo "  $(dim "$HTTP_UNIT")"
-  journalctl --user -u "$HTTP_UNIT" -n 3 --no-pager 2>/dev/null | sed 's/^/    /' || echo "    (none)"
-  echo "  $(dim "$TUNNEL_UNIT")"
-  journalctl --user -u "$TUNNEL_UNIT" -n 3 --no-pager 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+  if als_user_bus_ok; then
+    echo "  $(dim "$HTTP_UNIT")"
+    journalctl --user -u "$HTTP_UNIT" -n 3 --no-pager 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+    echo "  $(dim "$TUNNEL_UNIT")"
+    journalctl --user -u "$TUNNEL_UNIT" -n 3 --no-pager 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+  else
+    echo "  $(dim "(skipped — user bus wedged)")"
+  fi
   echo
 }
 
@@ -329,17 +377,29 @@ cmd_doctor() {
   [[ -s "$WRITE_TOKEN_FILE" ]] && check "mcp_write_token" 1 "$WRITE_TOKEN_FILE" || check "mcp_write_token" 0 "missing/empty"
   [[ -s "$ENV_FILE" ]] && check "env file" 1 "$ENV_FILE" || check "env file" 0 "missing/empty"
 
-  systemctl --user cat "$HTTP_UNIT" >/dev/null 2>&1 \
-    && check "http unit" 1 "$HTTP_UNIT" || check "http unit" 0 "not installed"
-  systemctl --user cat "$TUNNEL_UNIT" >/dev/null 2>&1 \
-    && check "tunnel unit" 1 "$TUNNEL_UNIT" || check "tunnel unit" 0 "not installed"
+  if als_user_bus_ok; then
+    check "user bus" 1 "responsive"
+    als_user_systemctl cat "$HTTP_UNIT" >/dev/null 2>&1 \
+      && check "http unit" 1 "$HTTP_UNIT" || check "http unit" 0 "not installed"
+    als_user_systemctl cat "$TUNNEL_UNIT" >/dev/null 2>&1 \
+      && check "tunnel unit" 1 "$TUNNEL_UNIT" || check "tunnel unit" 0 "not installed"
 
-  [[ "$(unit_state "$HTTP_UNIT")" == active ]] \
-    && check "http active" 1 "$(unit_state "$HTTP_UNIT")" \
-    || check "http active" 0 "$(unit_state "$HTTP_UNIT")"
-  [[ "$(unit_state "$TUNNEL_UNIT")" == active ]] \
-    && check "tunnel active" 1 "$(unit_state "$TUNNEL_UNIT")" \
-    || check "tunnel active" 0 "$(unit_state "$TUNNEL_UNIT")"
+    [[ "$(unit_state "$HTTP_UNIT")" == active ]] \
+      && check "http active" 1 "$(unit_state "$HTTP_UNIT")" \
+      || check "http active" 0 "$(unit_state "$HTTP_UNIT")"
+    [[ "$(unit_state "$TUNNEL_UNIT")" == active ]] \
+      && check "tunnel active" 1 "$(unit_state "$TUNNEL_UNIT")" \
+      || check "tunnel active" 0 "$(unit_state "$TUNNEL_UNIT")"
+  else
+    check "user bus" 0 "wedged — fail soft; do not kill systemd --user / dbus"
+  fi
+
+  [[ -x "$REPO_ROOT/scripts/als_map_isolate" ]] \
+    && check "isolate helper" 1 "$REPO_ROOT/scripts/als_map_isolate" \
+    || check "isolate helper" 0 "missing or not +x"
+  [[ -f "$REPO_ROOT/systemd/user/als-map-agent.slice" ]] \
+    && check "agent slice template" 1 "systemd/user/als-map-agent.slice" \
+    || check "agent slice template" 0 "missing"
 
   command -v cloudflared >/dev/null \
     && check "cloudflared" 1 "$(command -v cloudflared)" \
@@ -647,9 +707,14 @@ detect_terminal() {
 
 cmd_watch() {
   # Used by the desktop entry: ensure stack up, then live panel + access tail.
+  if ! als_user_bus_ok; then
+    als_user_systemd_fail_msg
+    echo "als_map_stack watch: cannot start units while user bus is wedged." >&2
+    return 75
+  fi
   ensure_token
   if [[ "$(unit_state "$HTTP_UNIT")" != active || "$(unit_state "$TUNNEL_UNIT")" != active ]]; then
-    systemctl --user enable --now "$HTTP_UNIT" "$TUNNEL_UNIT" >/dev/null || true
+    als_user_systemctl enable --now "$HTTP_UNIT" "$TUNNEL_UNIT" >/dev/null || true
     sleep 0.6
   fi
   touch "$ACCESS_LOG"

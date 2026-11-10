@@ -1,0 +1,14 @@
+[Unit]
+Description=ALS Map agent/smoke isolation slice
+Documentation=man:systemd.resource-control(5)
+# Aggregate ceiling for transient scopes from scripts/als_map_isolate.
+# Protects the desktop from runaway agent smoke (py_compile / index_create).
+# No CPUQuota — do not slow ALS Map search.
+
+[Slice]
+# Aggregate RAM for concurrent smoke scopes (scopes may set a tighter MemoryMax).
+MemoryMax=6G
+TasksMax=512
+
+[Install]
+WantedBy=default.target

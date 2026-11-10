@@ -14,6 +14,11 @@ als_map_stack probe      # human-readable live tool schema (tunnel)
 als_map_stack logs -f
 als_map_stack doctor
 als_map_stack install-desktop   # desktop icon + PATH symlink
+
+# process isolation (smoke / unit templates) — see below
+als_map_isolate install-units
+als_map_isolate run -- python -m py_compile scripts/als_map_lib.py
+als_map_isolate profiles
 ```
 
 **Restart after shipping tools.** The systemd unit runs whatever is checked out in `WorkingDirectory` (`~/Development/als_graph`). A live process keeps the old tool list until `als_map_stack restart` (or stop then start).
@@ -24,6 +29,7 @@ als_map_stack install-desktop   # desktop icon + PATH symlink
 |-------|--------|
 | HTTP MCP | systemd user unit `als-map-mcp-http.service` → `scripts/als_map_mcp_http.py` on `127.0.0.1:8787` |
 | Tunnel | `als-map-mcp-tunnel.service` → `cloudflared … run als-map-mcp` |
+| Agent slice | `als-map-agent.slice` — parent cgroup for smoke scopes (`scripts/als_map_isolate`) |
 | Token | `~/.config/als_map/mcp_token` + `EnvironmentFile` `~/.config/als_map/env` (never committed) |
 | Access log | `~/.local/state/als_map/access.log` |
 
@@ -100,8 +106,48 @@ Health
   public   ok 200  {"ok":true,"server":"als-map",…}
 ```
 
+## Process isolation (cgroups)
+
+Prefer **systemd/cgroups isolation** over query-tool throttling or sleep/backoff that would slow ALS Map search. **No `CPUQuota`.**
+
+Repo templates live under `systemd/user/`:
+
+| Unit | Role | Limits |
+|------|------|--------|
+| `als-map-agent.slice` | Parent for smoke/test scopes | `MemoryMax=6G`, `TasksMax=512` |
+| smoke scope (`als_map_isolate run`) | Agent `py_compile` / `index_create` / similar | `MemoryMax=4G`, `TasksMax=256`, `OOMScoreAdjust=700`, `Nice=10`, `IOSchedulingClass=best-effort` / priority `6` |
+| `als-map-mcp-http.service` | Live HTTP MCP | `MemoryMax=8G`, `TasksMax=128`, `OOMScoreAdjust=200` (ceilings only) |
+| `als-map-mcp-tunnel.service` | cloudflared | `MemoryMax=256M`, `TasksMax=32`, `OOMScoreAdjust=100` |
+
+```bash
+# Install slice + MCP *limit drop-ins* into ~/.config/systemd/user (safe daemon-reload).
+# Does NOT restart live MCP — host apply is deferred until the desktop is stable.
+# Drop-ins preserve existing ExecStart/WorkingDirectory; full templates stay in systemd/user/.
+scripts/als_map_isolate install-units
+# optional on a fresh host: scripts/als_map_isolate install-units --force-mcp-units
+
+# Run smoke under a transient scope in als-map-agent.slice
+scripts/als_map_isolate run -- .venv/bin/python - <<'PY'
+from als_map_lib import open_db_rw
+# …
+PY
+```
+
+Override smoke ceilings with `ALS_MAP_SMOKE_MEMORY_MAX`, `ALS_MAP_SMOKE_TASKS_MAX`, `ALS_MAP_SMOKE_OOM_SCORE`, `ALS_MAP_SMOKE_NICE`, `ALS_MAP_SMOKE_IO_*`.
+
+## Safe apply / reload (do not kill user systemd)
+
+After a wedged `systemctl --user` (`Transport endpoint is not connected`), **never** kill user systemd, session dbus, or hung `systemctl --user` children as recovery — that path is the suspected GUI-crash trigger.
+
+`als_map_stack` and `als_map_isolate` share `scripts/als_map_systemd.sh`:
+
+- Probe the user bus with a short timeout before mutations.
+- Wrap `systemctl --user` in `timeout`; on timeout or bus errors, **fail soft** (exit `75`) with a clear message.
+- Recovery is re-login / reboot when Austen confirms the desktop is stable — not process kills.
+
 ## Safety
 
 - Bearer token is **never** printed by `als_map_stack` or written to the access log.
 - Do not commit `~/.config/als_map/*` or `~/.cloudflared/*.json`.
-- Stack prefers existing user systemd units; it does not rewrite tunnel credentials.
+- Stack prefers existing user systemd units; `als_map_isolate install-units` installs the agent slice plus MCP `*.service.d/limits.conf` drop-ins (does not clobber ExecStart) and does not restart MCP by itself.
+- Do not rewrite tunnel credentials.
