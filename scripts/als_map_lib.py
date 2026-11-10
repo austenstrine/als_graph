@@ -5,6 +5,8 @@ Shared library for the Total ALS Map retrieval substrate.
 SQLite + external-content FTS5 over normalized Grok/X JSONL.
 Optional Phase 2′b local embeddings (numpy + sentence-transformers).
 Phase 2′c heuristic thread_features (no LLM).
+Named analysis indexes (message/thread id sets or saved filters) live in the
+same sqlite and optionally scope search/sample/stats/semantic.
 Used by build_map_index.py, build_map_embeddings.py,
 build_thread_features.py, map_query.py, and als_map_mcp.py.
 """
@@ -61,6 +63,28 @@ _EMBED_MODEL_CACHE: dict[str, Any] = {}
 THREAD_FEATURES_SCHEMA_VERSION = 1
 THREAD_FEATURES_META_KEY = "thread_features"
 DEFAULT_THREAD_FEATURES_LIMIT = 20
+
+# Named analysis indexes (same DB; survive FTS rebuild via copy).
+ANALYSIS_INDEX_SCHEMA_VERSION = 1
+ANALYSIS_INDEX_KINDS = frozenset({"message_ids", "thread_ids", "filter"})
+DEFAULT_INDEX_LIST_LIMIT = 20
+DEFAULT_INDEX_MEMBERS_LIMIT = 20
+MAX_INDEX_MEMBER_WRITE = 50
+MAX_INDEX_MEMBERS_TOTAL = 5_000
+MAX_INDEX_COUNT = 100
+MAX_MEMBER_ID_LEN = 256
+MAX_INDEX_DESCRIPTION_LEN = 500
+_INDEX_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+# Member ids are corpus ids / thread keys — never path-like.
+_MEMBER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$")
+_FILTER_TIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$"
+)
+_FILTER_ALLOWED_KEYS = frozenset({"sources", "source", "role", "since", "until"})
+_ALLOWED_ROLES = frozenset({"human", "assistant", "self"})
+KNOWN_SOURCES = frozenset(
+    {"grok_chat", "x_post", "x_reply", "x_repost", "x_like", "x_note"}
+)
 
 CITE_FIELDS = ("id", "source", "created_at", "url", "thread_id", "role")
 
@@ -176,6 +200,26 @@ CREATE INDEX IF NOT EXISTS idx_thread_features_flags
     ON thread_features(has_refine, has_critique, code_density);
 """
 
+_ANALYSIS_INDEX_DDL = """
+CREATE TABLE IF NOT EXISTS analysis_indexes (
+    name TEXT PRIMARY KEY,
+    version INTEGER NOT NULL DEFAULT 1,
+    kind TEXT NOT NULL,
+    description TEXT,
+    filter_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS analysis_index_members (
+    index_name TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    PRIMARY KEY (index_name, member_id),
+    FOREIGN KEY (index_name) REFERENCES analysis_indexes(name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_index_members_id
+    ON analysis_index_members(member_id);
+"""
+
 
 @dataclass(frozen=True)
 class InputFingerprint:
@@ -285,6 +329,256 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.executescript(_THREAD_FEATURES_DDL)
+    conn.executescript(_ANALYSIS_INDEX_DDL)
+
+
+def _has_analysis_index_tables(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='analysis_indexes'"
+    ).fetchone()
+    return row is not None
+
+
+def ensure_analysis_index_schema(conn: sqlite3.Connection) -> None:
+    """Idempotent DDL for named analysis indexes (writable connections only)."""
+    conn.executescript(_ANALYSIS_INDEX_DDL)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO map_meta(key, value) VALUES (?, ?)",
+            ("analysis_index_schema", str(ANALYSIS_INDEX_SCHEMA_VERSION)),
+        )
+    except sqlite3.Error:
+        # map_meta may be absent mid-rebuild; tables still created.
+        pass
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _normalize_index_name(name: str | None) -> str:
+    raw = (name or "").strip().lower()
+    # Reject path-like / traversal attempts before charset check.
+    if any(tok in raw for tok in ("/", "\\", "..", "\x00")):
+        raise ValueError("index name must not contain path separators or '..'")
+    if not raw or not _INDEX_NAME_RE.match(raw):
+        raise ValueError(
+            "index name must match ^[a-z][a-z0-9_-]{0,63}$ "
+            "(lowercase letters, digits, _-)"
+        )
+    return raw
+
+
+def _normalize_index_kind(kind: str | None) -> str:
+    k = (kind or "").strip().lower()
+    if k not in ANALYSIS_INDEX_KINDS:
+        raise ValueError(
+            "kind must be message_ids|thread_ids|filter "
+            f"(got {kind!r})"
+        )
+    return k
+
+
+def _normalize_description(description: str | None) -> str | None:
+    if description is None:
+        return None
+    text = str(description)
+    if len(text) > MAX_INDEX_DESCRIPTION_LEN:
+        raise ValueError(
+            f"description capped at {MAX_INDEX_DESCRIPTION_LEN} chars"
+        )
+    return text
+
+
+def _normalize_member_id(raw: Any) -> str | None:
+    mid = str(raw).strip()
+    if not mid:
+        return None
+    if len(mid) > MAX_MEMBER_ID_LEN:
+        raise ValueError(f"member id longer than {MAX_MEMBER_ID_LEN} chars")
+    if any(tok in mid for tok in ("/", "\\", "..", "\x00", " ")):
+        raise ValueError("member id must not contain spaces or path separators")
+    if not _MEMBER_ID_RE.match(mid):
+        raise ValueError(
+            "member id must match ^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$"
+        )
+    return mid
+
+
+def _normalize_member_ids(ids: Sequence[str] | None) -> list[str]:
+    if ids is None:
+        return []
+    if not isinstance(ids, (list, tuple)):
+        raise ValueError("ids must be an array of strings")
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in ids:
+        mid = _normalize_member_id(raw)
+        if mid is None or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+    if len(out) > MAX_INDEX_MEMBER_WRITE:
+        raise ValueError(
+            f"ids capped at {MAX_INDEX_MEMBER_WRITE} per call "
+            f"(got {len(out)})"
+        )
+    return out
+
+
+def _validate_filter_time(label: str, value: str) -> str:
+    text = str(value).strip()
+    if not _FILTER_TIME_RE.match(text):
+        raise ValueError(
+            f"{label} must be ISO-8601 date or datetime "
+            "(YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS][Z|±HH:MM])"
+        )
+    return text
+
+
+def _validate_filter_sources(src: Any) -> list[str]:
+    srcs = _parse_sources(src)
+    if not srcs:
+        raise ValueError("filter sources resolved empty")
+    bad = [s for s in srcs if s not in KNOWN_SOURCES]
+    if bad:
+        raise ValueError(
+            "filter sources must be known map sources or x|grok aliases; "
+            f"rejected: {bad}"
+        )
+    return srcs
+
+
+def _filter_expr_dict(
+    *,
+    sources: str | Sequence[str] | None = None,
+    role: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    filter_obj: dict[str, Any] | str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Normalize a saved filter expression (sources/role/since/until only).
+
+    Strict allowlist — never accepts free-form SQL / expressions. Values are
+    always bound as parameters later (no string concat into SQL).
+    """
+    base: dict[str, Any] = {}
+    if filter_obj is not None:
+        if isinstance(filter_obj, str):
+            if len(filter_obj) > 2_000:
+                raise ValueError("filter JSON too large")
+            try:
+                parsed = json.loads(filter_obj)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"filter must be JSON object: {exc}") from exc
+        else:
+            parsed = filter_obj
+        if not isinstance(parsed, dict):
+            raise ValueError("filter must be a JSON object")
+        unknown = set(parsed.keys()) - _FILTER_ALLOWED_KEYS
+        if unknown:
+            raise ValueError(
+                "filter allows only sources/source/role/since/until; "
+                f"rejected keys: {sorted(unknown)}"
+            )
+        for key in _FILTER_ALLOWED_KEYS:
+            if key in parsed and parsed[key] is not None:
+                base[key] = parsed[key]
+    if sources is not None:
+        base["sources"] = sources
+    if role is not None:
+        base["role"] = role
+    if since is not None:
+        base["since"] = since
+    if until is not None:
+        base["until"] = until
+    out: dict[str, Any] = {}
+    src = base.get("sources", base.get("source"))
+    if src is not None:
+        out["sources"] = _validate_filter_sources(src)
+    if "role" in base:
+        role_val = base["role"]
+        if role_val == "" or role_val is None:
+            out["role"] = None
+        else:
+            role_s = str(role_val).strip()
+            if role_s not in _ALLOWED_ROLES:
+                raise ValueError(
+                    "filter role must be human|assistant|self "
+                    f"(got {role_val!r})"
+                )
+            out["role"] = role_s
+    if base.get("since"):
+        out["since"] = _validate_filter_time("since", str(base["since"]))
+    if base.get("until"):
+        out["until"] = _validate_filter_time("until", str(base["until"]))
+    return out or None
+
+
+def _copy_analysis_indexes(
+    src_db: Path, dest_conn: sqlite3.Connection
+) -> int:
+    """Copy analysis index tables from an existing DB into dest (rebuild)."""
+    src_db = Path(src_db)
+    if not src_db.exists():
+        return 0
+    ensure_analysis_index_schema(dest_conn)
+    try:
+        with connect(src_db, readonly=True) as src:
+            tables = {
+                r["name"]
+                for r in src.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "analysis_indexes" not in tables:
+                return 0
+            rows = src.execute(
+                """
+                SELECT name, version, kind, description, filter_json,
+                       created_at, updated_at
+                FROM analysis_indexes
+                """
+            ).fetchall()
+            if not rows:
+                return 0
+            dest_conn.executemany(
+                """
+                INSERT OR REPLACE INTO analysis_indexes
+                    (name, version, kind, description, filter_json,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        r["name"],
+                        int(r["version"]),
+                        r["kind"],
+                        r["description"],
+                        r["filter_json"],
+                        r["created_at"],
+                        r["updated_at"],
+                    )
+                    for r in rows
+                ],
+            )
+            if "analysis_index_members" in tables:
+                members = src.execute(
+                    "SELECT index_name, member_id FROM analysis_index_members"
+                ).fetchall()
+                if members:
+                    dest_conn.executemany(
+                        """
+                        INSERT OR IGNORE INTO analysis_index_members
+                            (index_name, member_id)
+                        VALUES (?, ?)
+                        """,
+                        [(m["index_name"], m["member_id"]) for m in members],
+                    )
+            return len(rows)
+    except sqlite3.Error:
+        return 0
 
 
 def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -449,6 +743,10 @@ def build_index(
         )
         # Phase 2′c heuristics — same fingerprint as FTS rows.
         build_thread_features(conn, force=True, records_fingerprint=fp.digest())
+        # Named analysis indexes: create empty tables, then copy from prior DB.
+        ensure_analysis_index_schema(conn)
+        if db_path.exists():
+            _copy_analysis_indexes(db_path, conn)
         conn.commit()
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
@@ -542,6 +840,96 @@ def _filter_where(
         where.append(f"{prefix}created_at IS NOT NULL AND {prefix}created_at < ?")
         params.append(until)
     return " AND ".join(where), params
+
+
+def _load_analysis_index(
+    conn: sqlite3.Connection, name: str
+) -> sqlite3.Row | None:
+    if not _has_analysis_index_tables(conn):
+        return None
+    return conn.execute(
+        """
+        SELECT name, version, kind, description, filter_json,
+               created_at, updated_at
+        FROM analysis_indexes WHERE name = ?
+        """,
+        (name,),
+    ).fetchone()
+
+
+def _index_scope_clause(
+    conn: sqlite3.Connection,
+    index: str | None,
+    *,
+    table_alias: str = "",
+) -> tuple[str | None, list[Any], dict[str, Any] | None]:
+    """
+    Optional named-index scope → (sql_fragment, params, index_meta).
+
+    message_ids → id IN members; thread_ids → thread_id IN members;
+    filter → AND saved filter expression. Returns (None, [], None) when unset.
+    """
+    if index is None or str(index).strip() == "":
+        return None, [], None
+    name = _normalize_index_name(str(index))
+    if not _has_analysis_index_tables(conn):
+        raise ValueError(
+            f"unknown analysis index: {name} "
+            "(analysis index tables missing — create one via als_index_create)"
+        )
+    row = _load_analysis_index(conn, name)
+    if row is None:
+        raise ValueError(f"unknown analysis index: {name}")
+    prefix = f"{table_alias}." if table_alias else ""
+    kind = str(row["kind"])
+    meta = {
+        "name": row["name"],
+        "version": int(row["version"]),
+        "kind": kind,
+    }
+    if kind == "message_ids":
+        return (
+            f"{prefix}id IN (SELECT member_id FROM analysis_index_members "
+            f"WHERE index_name = ?)",
+            [name],
+            meta,
+        )
+    if kind == "thread_ids":
+        return (
+            f"{prefix}thread_id IN (SELECT member_id FROM analysis_index_members "
+            f"WHERE index_name = ?)",
+            [name],
+            meta,
+        )
+    # filter kind — evaluate saved expression at query time
+    filt = _filter_expr_dict(filter_obj=row["filter_json"])
+    if not filt:
+        return "1=0", [], meta  # empty filter matches nothing
+    where_sql, params = _filter_where(
+        sources=filt.get("sources"),
+        role=filt.get("role"),
+        since=filt.get("since"),
+        until=filt.get("until"),
+        table_alias=table_alias,
+    )
+    return where_sql, params, meta
+
+
+def _apply_index_scope(
+    conn: sqlite3.Connection,
+    where: list[str],
+    params: list[Any],
+    index: str | None,
+    *,
+    table_alias: str = "",
+) -> dict[str, Any] | None:
+    clause, extra, meta = _index_scope_clause(
+        conn, index, table_alias=table_alias
+    )
+    if clause:
+        where.append(f"({clause})")
+        params.extend(extra)
+    return meta
 
 
 def _median(sorted_vals: Sequence[float]) -> float | None:
@@ -657,6 +1045,7 @@ def search(
     role: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    index: str | None = None,
     limit: int | None = None,
     offset: int = 0,
     max_chars: int | None = None,
@@ -690,6 +1079,7 @@ def search(
     if until:
         where.append("r.created_at IS NOT NULL AND r.created_at < ?")
         params.append(until)
+    index_meta = _apply_index_scope(conn, where, params, index, table_alias="r")
 
     sql = f"""
         SELECT r.id, r.source, r.created_at, r.url, r.thread_id, r.role, r.text, r.meta_json,
@@ -725,17 +1115,18 @@ def search(
             item["meta"] = meta
         hits.append(item)
 
-    return _fit_response(
-        {
-            "op": "search",
-            "query": q,
-            "limit": lim,
-            "offset": off,
-            "returned": len(hits),
-            "full_text": full_text,
-            "hits": hits,
-        }
-    )
+    out: dict[str, Any] = {
+        "op": "search",
+        "query": q,
+        "limit": lim,
+        "offset": off,
+        "returned": len(hits),
+        "full_text": full_text,
+        "hits": hits,
+    }
+    if index_meta is not None:
+        out["index"] = index_meta
+    return _fit_response(out)
 
 
 def get_one(
@@ -876,6 +1267,7 @@ def browse(
     until: str | None = None,
     sources: str | Sequence[str] | None = None,
     role: str | None = None,
+    index: str | None = None,
     limit: int | None = None,
     offset: int = 0,
     max_chars: int | None = None,
@@ -902,6 +1294,7 @@ def browse(
     if role is not None:
         where.append("role IS ?" if role == "" else "role = ?")
         params.append(None if role == "" else role)
+    index_meta = _apply_index_scope(conn, where, params, index)
 
     where_sql = " AND ".join(where)
     total = conn.execute(
@@ -931,26 +1324,41 @@ def browse(
         if meta is not None:
             item["meta"] = meta
         hits.append(item)
-    return _fit_response(
-        {
-            "op": "browse",
-            "since": since,
-            "until": until,
-            "total": int(total),
-            "limit": lim,
-            "offset": off,
-            "returned": len(hits),
-            "hits": hits,
-        }
-    )
+    out: dict[str, Any] = {
+        "op": "browse",
+        "since": since,
+        "until": until,
+        "total": int(total),
+        "limit": lim,
+        "offset": off,
+        "returned": len(hits),
+        "hits": hits,
+    }
+    if index_meta is not None:
+        out["index"] = index_meta
+    return _fit_response(out)
 
 
 def stats(
     conn: sqlite3.Connection,
     *,
     breakdown: str | None = "source",
+    index: str | None = None,
+    sources: str | Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    total = conn.execute("SELECT COUNT(*) AS n FROM records").fetchone()["n"]
+    where = ["1=1"]
+    params: list[Any] = []
+    srcs = _parse_sources(sources)
+    if srcs:
+        where.append(f"source IN ({','.join('?' * len(srcs))})")
+        params.extend(srcs)
+    index_meta = _apply_index_scope(conn, where, params, index)
+    where_sql = " AND ".join(where)
+
+    total = conn.execute(
+        f"SELECT COUNT(*) AS n FROM records WHERE {where_sql}",
+        params,
+    ).fetchone()["n"]
     meta_rows = {
         r["key"]: r["value"]
         for r in conn.execute("SELECT key, value FROM map_meta").fetchall()
@@ -961,6 +1369,10 @@ def stats(
         "built_at": meta_rows.get("built_at"),
         "fingerprint": None,
     }
+    if sources is not None:
+        out["sources"] = sources
+    if index_meta is not None:
+        out["index"] = index_meta
     if "fingerprint" in meta_rows:
         try:
             out["fingerprint"] = json.loads(meta_rows["fingerprint"])
@@ -970,32 +1382,47 @@ def stats(
     bd = (breakdown or "source").lower()
     if bd in ("source", "both"):
         rows = conn.execute(
-            "SELECT source, COUNT(*) AS n FROM records GROUP BY source ORDER BY n DESC"
+            f"""
+            SELECT source, COUNT(*) AS n FROM records
+            WHERE {where_sql}
+            GROUP BY source ORDER BY n DESC
+            """,
+            params,
         ).fetchall()
         out["by_source"] = {r["source"]: int(r["n"]) for r in rows}
     if bd in ("role", "both"):
         rows = conn.execute(
-            """
+            f"""
             SELECT COALESCE(role, 'null') AS role, COUNT(*) AS n
-            FROM records GROUP BY role ORDER BY n DESC
-            """
+            FROM records
+            WHERE {where_sql}
+            GROUP BY role ORDER BY n DESC
+            """,
+            params,
         ).fetchall()
         out["by_role"] = {r["role"]: int(r["n"]) for r in rows}
     if bd == "month":
         rows = conn.execute(
-            """
+            f"""
             SELECT substr(created_at, 1, 7) AS month, COUNT(*) AS n
             FROM records
-            WHERE created_at IS NOT NULL AND length(created_at) >= 7
+            WHERE {where_sql}
+              AND created_at IS NOT NULL AND length(created_at) >= 7
             GROUP BY month
             ORDER BY month
-            """
+            """,
+            params,
         ).fetchall()
         out["by_month"] = {r["month"]: int(r["n"]) for r in rows}
     elif bd not in ("source", "role", "both", "month", "none", ""):
         out["warning"] = f"unknown breakdown {breakdown!r}; used source"
         rows = conn.execute(
-            "SELECT source, COUNT(*) AS n FROM records GROUP BY source ORDER BY n DESC"
+            f"""
+            SELECT source, COUNT(*) AS n FROM records
+            WHERE {where_sql}
+            GROUP BY source ORDER BY n DESC
+            """,
+            params,
         ).fetchall()
         out["by_source"] = {r["source"]: int(r["n"]) for r in rows}
 
@@ -1009,6 +1436,7 @@ def sample(
     role: str | None = None,
     source: str | Sequence[str] | None = None,
     sources: str | Sequence[str] | None = None,
+    index: str | None = None,
     stratify_by: str | None = "none",
     seed: int | None = None,
     max_chars: int | None = None,
@@ -1025,6 +1453,9 @@ def sample(
     max_c = _clamp_chars(max_chars, DEFAULT_SNIPPET_CHARS, MAX_SNIPPET_CHARS)
     src_arg = source if source is not None else sources
     where_sql, params = _filter_where(sources=src_arg, role=role)
+    where_parts = [where_sql]
+    index_meta = _apply_index_scope(conn, where_parts, params, index)
+    where_sql = " AND ".join(where_parts)
     feature_filters = {
         "min_thread_length": min_thread_length,
         "has_refine": has_refine,
@@ -1139,21 +1570,22 @@ def sample(
         item["text_truncated"] = trunc
         hits.append(item)
 
-    return _fit_response(
-        {
-            "op": "sample",
-            "n": lim,
-            "role": role,
-            "source": src_arg,
-            "stratify_by": strat,
-            "seed": seed,
-            "feature_filters": feature_filters,
-            "eligible": total,
-            "returned": len(hits),
-            "buckets": buckets_meta,
-            "hits": hits,
-        }
-    )
+    out_sample: dict[str, Any] = {
+        "op": "sample",
+        "n": lim,
+        "role": role,
+        "source": src_arg,
+        "stratify_by": strat,
+        "seed": seed,
+        "feature_filters": feature_filters,
+        "eligible": total,
+        "returned": len(hits),
+        "buckets": buckets_meta,
+        "hits": hits,
+    }
+    if index_meta is not None:
+        out_sample["index"] = index_meta
+    return _fit_response(out_sample)
 
 
 def style_stats(
@@ -1164,6 +1596,7 @@ def style_stats(
     role: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    index: str | None = None,
     opening_ngrams_top: int = DEFAULT_OPENING_NGRAM_TOP,
     opening_role: str | None = None,
 ) -> dict[str, Any]:
@@ -1172,6 +1605,9 @@ def style_stats(
     where_sql, params = _filter_where(
         sources=src_arg, role=role, since=since, until=until
     )
+    where_parts = [where_sql]
+    index_meta = _apply_index_scope(conn, where_parts, params, index)
+    where_sql = " AND ".join(where_parts)
     top_n = max(0, min(int(opening_ngrams_top), 50))
     # Default: opening n-grams from human turns; if caller already filters a
     # role (e.g. X `self`), use that slice instead of empty n-grams.
@@ -1241,14 +1677,17 @@ def style_stats(
     def _top(counter: Counter[str]) -> list[dict[str, Any]]:
         return [{"ngram": k, "count": int(v)} for k, v in counter.most_common(top_n)]
 
+    filters_out: dict[str, Any] = {
+        "source": src_arg,
+        "role": role,
+        "since": since,
+        "until": until,
+    }
+    if index_meta is not None:
+        filters_out["index"] = index_meta
     out: dict[str, Any] = {
         "op": "style_stats",
-        "filters": {
-            "source": src_arg,
-            "role": role,
-            "since": since,
-            "until": until,
-        },
+        "filters": filters_out,
         "count": count,
         "char_length": {
             "mean": None if count == 0 else round(_mean(char_lens) or 0.0, 3),
@@ -1737,6 +2176,7 @@ def semantic_search(
     role: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    index: str | None = None,
     limit: int | None = None,
     max_chars: int | None = None,
     embeddings_path: Path = DEFAULT_EMBEDDINGS,
@@ -1750,8 +2190,8 @@ def semantic_search(
     snippet_chars = _clamp_chars(max_chars, DEFAULT_SNIPPET_CHARS, MAX_SNIPPET_CHARS)
     np = _require_numpy()
 
-    index = _load_embed_index(Path(embeddings_path), Path(meta_path))
-    model_name = str(index.get("model") or DEFAULT_EMBED_MODEL)
+    embed_index = _load_embed_index(Path(embeddings_path), Path(meta_path))
+    model_name = str(embed_index.get("model") or DEFAULT_EMBED_MODEL)
     model = _require_sentence_transformer(model_name)
     q_vec = model.encode(
         [q],
@@ -1760,29 +2200,38 @@ def semantic_search(
     )
     q_vec = np.asarray(q_vec, dtype=np.float32).reshape(-1)
 
-    vectors = index["vectors"]
-    ids = index["ids"]
+    vectors = embed_index["vectors"]
+    ids = embed_index["ids"]
+
+    def _empty_sem(*, index_meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "op": "semantic_search",
+            "query": q,
+            "limit": lim,
+            "returned": 0,
+            "model": model_name,
+            "hits": [],
+        }
+        if index_meta is not None:
+            payload["index"] = index_meta
+        return _fit_response(payload)
+
     if vectors.shape[0] == 0:
-        return _fit_response(
-            {
-                "op": "semantic_search",
-                "query": q,
-                "limit": lim,
-                "returned": 0,
-                "model": model_name,
-                "hits": [],
-            }
-        )
+        return _empty_sem()
 
     where_sql, params = _filter_where(
         sources=sources, role=role, since=since, until=until
     )
+    where_parts = [where_sql]
+    index_meta = _apply_index_scope(conn, where_parts, params, index)
+    where_sql = " AND ".join(where_parts)
     # If any filter is active, restrict to matching ids.
     filter_active = bool(
         _parse_sources(sources) is not None
         or role is not None
         or since
         or until
+        or index_meta is not None
     )
     candidate_rows: np.ndarray | None = None
     if filter_active:
@@ -1793,29 +2242,11 @@ def semantic_search(
             )
         }
         if not allowed:
-            return _fit_response(
-                {
-                    "op": "semantic_search",
-                    "query": q,
-                    "limit": lim,
-                    "returned": 0,
-                    "model": model_name,
-                    "hits": [],
-                }
-            )
-        id_to_row = index["id_to_row"]
+            return _empty_sem(index_meta=index_meta)
+        id_to_row = embed_index["id_to_row"]
         rows_list = [id_to_row[i] for i in allowed if i in id_to_row]
         if not rows_list:
-            return _fit_response(
-                {
-                    "op": "semantic_search",
-                    "query": q,
-                    "limit": lim,
-                    "returned": 0,
-                    "model": model_name,
-                    "hits": [],
-                }
-            )
+            return _empty_sem(index_meta=index_meta)
         candidate_rows = np.asarray(rows_list, dtype=np.int64)
         scores = vectors[candidate_rows] @ q_vec
         top_n = min(lim, scores.shape[0])
@@ -1862,16 +2293,17 @@ def semantic_search(
         item["snippet"] = snip
         hits.append(item)
 
-    return _fit_response(
-        {
-            "op": "semantic_search",
-            "query": q,
-            "limit": lim,
-            "returned": len(hits),
-            "model": model_name,
-            "hits": hits,
-        }
-    )
+    out: dict[str, Any] = {
+        "op": "semantic_search",
+        "query": q,
+        "limit": lim,
+        "returned": len(hits),
+        "model": model_name,
+        "hits": hits,
+    }
+    if index_meta is not None:
+        out["index"] = index_meta
+    return _fit_response(out)
 
 
 def _is_humanish_role(role: str | None) -> bool:
@@ -2353,5 +2785,396 @@ def thread_features(
     )
 
 
-def open_db(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
-    return connect(db_path, readonly=True)
+def _index_member_count(conn: sqlite3.Connection, name: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM analysis_index_members WHERE index_name = ?",
+        (name,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def _index_summary(
+    conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
+) -> dict[str, Any]:
+    get = row.__getitem__
+    name = get("name")
+    kind = get("kind")
+    filt = None
+    if get("filter_json"):
+        try:
+            filt = json.loads(get("filter_json"))
+        except (TypeError, json.JSONDecodeError):
+            filt = get("filter_json")
+    out: dict[str, Any] = {
+        "name": name,
+        "version": int(get("version")),
+        "kind": kind,
+        "description": get("description"),
+        "filter": filt,
+        "member_count": (
+            _index_member_count(conn, name) if kind in ("message_ids", "thread_ids") else None
+        ),
+        "created_at": get("created_at"),
+        "updated_at": get("updated_at"),
+    }
+    return out
+
+
+def index_create(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    kind: str = "message_ids",
+    description: str | None = None,
+    ids: Sequence[str] | None = None,
+    filter: dict[str, Any] | str | None = None,
+    sources: str | Sequence[str] | None = None,
+    role: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    replace: bool = False,
+) -> dict[str, Any]:
+    """Create a named analysis index (optional; competing names OK)."""
+    ensure_analysis_index_schema(conn)
+    iname = _normalize_index_name(name)
+    ikind = _normalize_index_kind(kind)
+    desc = _normalize_description(description)
+    members = _normalize_member_ids(ids)
+    if len(members) > MAX_INDEX_MEMBERS_TOTAL:
+        raise ValueError(
+            f"index members capped at {MAX_INDEX_MEMBERS_TOTAL} "
+            f"(got {len(members)})"
+        )
+    filt = _filter_expr_dict(
+        sources=sources, role=role, since=since, until=until, filter_obj=filter
+    )
+    if ikind == "filter":
+        if filt is None:
+            raise ValueError("filter kind requires a filter expression")
+        if members:
+            raise ValueError("filter kind does not take ids (use message_ids/thread_ids)")
+    else:
+        # id-based indexes may start empty; filter_json optional provenance only
+        pass
+
+    existing = _load_analysis_index(conn, iname)
+    now = _utc_now_iso()
+    if existing is not None:
+        if not replace:
+            raise ValueError(
+                f"analysis index {iname!r} already exists "
+                f"(version {int(existing['version'])}); pass replace=true"
+            )
+        version = int(existing["version"]) + 1
+        created_at = existing["created_at"]
+        conn.execute("DELETE FROM analysis_index_members WHERE index_name = ?", (iname,))
+        conn.execute(
+            """
+            UPDATE analysis_indexes
+            SET version = ?, kind = ?, description = ?, filter_json = ?,
+                updated_at = ?
+            WHERE name = ?
+            """,
+            (
+                version,
+                ikind,
+                desc,
+                json.dumps(filt, separators=(",", ":")) if filt else None,
+                now,
+                iname,
+            ),
+        )
+    else:
+        n_indexes = conn.execute(
+            "SELECT COUNT(*) AS n FROM analysis_indexes"
+        ).fetchone()["n"]
+        if int(n_indexes) >= MAX_INDEX_COUNT:
+            raise ValueError(
+                f"at most {MAX_INDEX_COUNT} named analysis indexes allowed"
+            )
+        version = 1
+        created_at = now
+        conn.execute(
+            """
+            INSERT INTO analysis_indexes
+                (name, version, kind, description, filter_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                iname,
+                version,
+                ikind,
+                desc,
+                json.dumps(filt, separators=(",", ":")) if filt else None,
+                created_at,
+                now,
+            ),
+        )
+
+    if members and ikind in ("message_ids", "thread_ids"):
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO analysis_index_members (index_name, member_id)
+            VALUES (?, ?)
+            """,
+            [(iname, mid) for mid in members],
+        )
+
+    row = _load_analysis_index(conn, iname)
+    assert row is not None
+    summary = _index_summary(conn, row)
+    return _fit_response(
+        {
+            "op": "index_create",
+            "created": existing is None,
+            "replaced": existing is not None,
+            "index": summary,
+            "schema_version": ANALYSIS_INDEX_SCHEMA_VERSION,
+        }
+    )
+
+
+def index_list(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict[str, Any]:
+    lim = _clamp_limit(limit, DEFAULT_INDEX_LIST_LIMIT)
+    off = max(0, int(offset))
+    if not _has_analysis_index_tables(conn):
+        return _fit_response(
+            {
+                "op": "index_list",
+                "total": 0,
+                "limit": lim,
+                "offset": off,
+                "returned": 0,
+                "indexes": [],
+                "schema_version": ANALYSIS_INDEX_SCHEMA_VERSION,
+            }
+        )
+    total = conn.execute("SELECT COUNT(*) AS n FROM analysis_indexes").fetchone()["n"]
+    rows = conn.execute(
+        """
+        SELECT name, version, kind, description, filter_json, created_at, updated_at
+        FROM analysis_indexes
+        ORDER BY name ASC
+        LIMIT ? OFFSET ?
+        """,
+        (lim, off),
+    ).fetchall()
+    items = [_index_summary(conn, r) for r in rows]
+    return _fit_response(
+        {
+            "op": "index_list",
+            "total": int(total),
+            "limit": lim,
+            "offset": off,
+            "returned": len(items),
+            "indexes": items,
+            "schema_version": ANALYSIS_INDEX_SCHEMA_VERSION,
+        }
+    )
+
+
+def index_get(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict[str, Any]:
+    iname = _normalize_index_name(name)
+    row = _load_analysis_index(conn, iname)
+    if row is None:
+        return _fit_response(
+            {
+                "op": "index_get",
+                "name": iname,
+                "found": False,
+                "index": None,
+                "members": [],
+            }
+        )
+    lim = _clamp_limit(limit, DEFAULT_INDEX_MEMBERS_LIMIT)
+    off = max(0, int(offset))
+    summary = _index_summary(conn, row)
+    members: list[str] = []
+    member_total = 0
+    if row["kind"] in ("message_ids", "thread_ids"):
+        member_total = _index_member_count(conn, iname)
+        members = [
+            str(r["member_id"])
+            for r in conn.execute(
+                """
+                SELECT member_id FROM analysis_index_members
+                WHERE index_name = ?
+                ORDER BY member_id ASC
+                LIMIT ? OFFSET ?
+                """,
+                (iname, lim, off),
+            )
+        ]
+    return _fit_response(
+        {
+            "op": "index_get",
+            "name": iname,
+            "found": True,
+            "index": summary,
+            "member_total": member_total if row["kind"] != "filter" else None,
+            "limit": lim,
+            "offset": off,
+            "returned": len(members),
+            "members": members,
+            "schema_version": ANALYSIS_INDEX_SCHEMA_VERSION,
+        }
+    )
+
+
+def index_delete(conn: sqlite3.Connection, name: str) -> dict[str, Any]:
+    iname = _normalize_index_name(name)
+    if not _has_analysis_index_tables(conn):
+        return _fit_response(
+            {
+                "op": "index_delete",
+                "name": iname,
+                "deleted": False,
+                "found": False,
+            }
+        )
+    row = _load_analysis_index(conn, iname)
+    if row is None:
+        return _fit_response(
+            {
+                "op": "index_delete",
+                "name": iname,
+                "deleted": False,
+                "found": False,
+            }
+        )
+    summary = _index_summary(conn, row)
+    conn.execute("DELETE FROM analysis_index_members WHERE index_name = ?", (iname,))
+    conn.execute("DELETE FROM analysis_indexes WHERE name = ?", (iname,))
+    return _fit_response(
+        {
+            "op": "index_delete",
+            "name": iname,
+            "deleted": True,
+            "found": True,
+            "index": summary,
+        }
+    )
+
+
+def index_add_ids(
+    conn: sqlite3.Connection,
+    name: str,
+    ids: Sequence[str],
+) -> dict[str, Any]:
+    """Append members to a message_ids/thread_ids index; bumps version."""
+    ensure_analysis_index_schema(conn)
+    iname = _normalize_index_name(name)
+    members = _normalize_member_ids(ids)
+    if not members:
+        raise ValueError("ids required")
+    row = _load_analysis_index(conn, iname)
+    if row is None:
+        raise ValueError(f"unknown analysis index: {iname}")
+    if row["kind"] == "filter":
+        raise ValueError("cannot add ids to a filter-kind index")
+    before = _index_member_count(conn, iname)
+    if before >= MAX_INDEX_MEMBERS_TOTAL:
+        raise ValueError(
+            f"index members capped at {MAX_INDEX_MEMBERS_TOTAL} "
+            f"(already {before})"
+        )
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO analysis_index_members (index_name, member_id)
+        VALUES (?, ?)
+        """,
+        [(iname, mid) for mid in members],
+    )
+    after = _index_member_count(conn, iname)
+    if after > MAX_INDEX_MEMBERS_TOTAL:
+        # Roll back via raising inside caller's transaction.
+        raise ValueError(
+            f"index members capped at {MAX_INDEX_MEMBERS_TOTAL} "
+            f"(would be {after} after add)"
+        )
+    now = _utc_now_iso()
+    version = int(row["version"]) + 1
+    conn.execute(
+        "UPDATE analysis_indexes SET version = ?, updated_at = ? WHERE name = ?",
+        (version, now, iname),
+    )
+    row2 = _load_analysis_index(conn, iname)
+    assert row2 is not None
+    return _fit_response(
+        {
+            "op": "index_add_ids",
+            "name": iname,
+            "added": after - before,
+            "submitted": len(members),
+            "index": _index_summary(conn, row2),
+        }
+    )
+
+
+def index_replace_members(
+    conn: sqlite3.Connection,
+    name: str,
+    ids: Sequence[str],
+) -> dict[str, Any]:
+    """Replace all members of a message_ids/thread_ids index; bumps version."""
+    ensure_analysis_index_schema(conn)
+    iname = _normalize_index_name(name)
+    members = _normalize_member_ids(ids)
+    if len(members) > MAX_INDEX_MEMBERS_TOTAL:
+        raise ValueError(
+            f"index members capped at {MAX_INDEX_MEMBERS_TOTAL} "
+            f"(got {len(members)})"
+        )
+    row = _load_analysis_index(conn, iname)
+    if row is None:
+        raise ValueError(f"unknown analysis index: {iname}")
+    if row["kind"] == "filter":
+        raise ValueError("cannot replace members on a filter-kind index")
+    conn.execute("DELETE FROM analysis_index_members WHERE index_name = ?", (iname,))
+    if members:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO analysis_index_members (index_name, member_id)
+            VALUES (?, ?)
+            """,
+            [(iname, mid) for mid in members],
+        )
+    now = _utc_now_iso()
+    version = int(row["version"]) + 1
+    conn.execute(
+        "UPDATE analysis_indexes SET version = ?, updated_at = ? WHERE name = ?",
+        (version, now, iname),
+    )
+    row2 = _load_analysis_index(conn, iname)
+    assert row2 is not None
+    return _fit_response(
+        {
+            "op": "index_replace_members",
+            "name": iname,
+            "member_count": len(members),
+            "index": _index_summary(conn, row2),
+        }
+    )
+
+
+def open_db(db_path: Path = DEFAULT_DB, *, readonly: bool = True) -> sqlite3.Connection:
+    conn = connect(db_path, readonly=readonly)
+    if not readonly:
+        ensure_analysis_index_schema(conn)
+    return conn
+
+
+def open_db_rw(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
+    """Writable connection; ensures analysis-index schema exists."""
+    return open_db(db_path, readonly=False)

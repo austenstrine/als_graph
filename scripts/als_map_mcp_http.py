@@ -8,12 +8,16 @@ hostname exists.
 
 Transport: MCP Streamable HTTP (POST + optional GET SSE on /mcp).
 Auth: Authorization: Bearer <ALS_MAP_MCP_TOKEN> required on every /mcp request.
+Index writes: ALS_MAP_MCP_WRITE_TOKEN via tool arg write_token or header
+  X-ALS-Map-Write-Token (injected into mutating tools/call args).
 Bind: 127.0.0.1 by default (set ALS_MAP_MCP_HOST / ALS_MAP_MCP_PORT).
 
 Stdlib only — no FastAPI / mcp package.
 
 Env:
   ALS_MAP_MCP_TOKEN   required bearer token (generate: openssl rand -hex 32)
+  ALS_MAP_MCP_WRITE_TOKEN  required for als_index_* mutations (unless ALLOW_INDEX_WRITES)
+  ALS_MAP_ALLOW_INDEX_WRITES  set to 1 to allow mutations without write token (local)
   ALS_MAP_MCP_HOST    default 127.0.0.1
   ALS_MAP_MCP_PORT    default 8787
   ALS_MAP_DB          optional sqlite path
@@ -45,6 +49,7 @@ from als_map_mcp import (  # noqa: E402
     PROTOCOL_VERSION,
     SERVER_NAME,
     SERVER_VERSION,
+    WRITE_TOKEN_ARG,
     handle_message,
     log,
 )
@@ -56,6 +61,15 @@ MCP_PATH = "/mcp"
 MAX_BODY_BYTES = 1_048_576  # 1 MiB JSON-RPC body cap
 SESSION_TTL_SEC = 3600
 DEFAULT_ACCESS_LOG = Path.home() / ".local" / "state" / "als_map" / "access.log"
+WRITE_TOKEN_HEADER = "X-ALS-Map-Write-Token"
+_MUTATING_TOOL_NAMES = frozenset(
+    {
+        "als_index_create",
+        "als_index_delete",
+        "als_index_add_ids",
+        "als_index_replace_members",
+    }
+)
 _ACCESS_LOG_LOCK = threading.Lock()
 
 
@@ -109,6 +123,38 @@ def parse_mcp_meta(msg: Any) -> tuple[str | None, str | None]:
             if isinstance(name, str) and name:
                 tool = name
     return mcp_method, tool
+
+
+def inject_write_token_from_header(msg: dict[str, Any], headers: Any) -> None:
+    """
+    For mutating tools/call, copy X-ALS-Map-Write-Token into arguments.write_token
+    when the arg is absent. Lets clients keep the write secret in MCP headers
+    instead of every tool call body (Bearer remains the read perimeter).
+    """
+    if msg.get("method") != "tools/call":
+        return
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return
+    name = params.get("name")
+    if name not in _MUTATING_TOOL_NAMES:
+        return
+    header_val = ""
+    try:
+        header_val = (headers.get(WRITE_TOKEN_HEADER) or "").strip()
+    except Exception:  # noqa: BLE001 — header map quirks
+        header_val = ""
+    if not header_val:
+        return
+    args = params.get("arguments")
+    if args is None:
+        params["arguments"] = {WRITE_TOKEN_ARG: header_val}
+        return
+    if not isinstance(args, dict):
+        return
+    existing = str(args.get(WRITE_TOKEN_ARG) or "").strip()
+    if not existing:
+        args[WRITE_TOKEN_ARG] = header_val
 
 
 def require_token() -> str:
@@ -239,7 +285,12 @@ class MCPHandler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             rendered = fmt
         lowered = rendered.lower()
-        if "authorization" in lowered or "bearer " in lowered:
+        if (
+            "authorization" in lowered
+            or "bearer " in lowered
+            or "x-als-map-write-token" in lowered
+            or "write_token" in lowered
+        ):
             rendered = "<redacted request log>"
         log(f"{self.address_string()} - {rendered}")
 
@@ -428,6 +479,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             return
 
         mcp_method, tool = parse_mcp_meta(msg)
+        inject_write_token_from_header(msg, self.headers)
 
         # Notifications / responses: 202 Accepted, no body
         is_notification = "id" not in msg and msg.get("method")
@@ -457,10 +509,11 @@ class MCPHandler(BaseHTTPRequestHandler):
             resp = handle_message(msg)
         except Exception as exc:  # noqa: BLE001
             log(traceback.format_exc())
+            # Generic client message — keep detail on stderr only (no path leak).
             resp = {
                 "jsonrpc": "2.0",
                 "id": msg.get("id"),
-                "error": {"code": -32603, "message": str(exc)},
+                "error": {"code": -32603, "message": "internal error"},
             }
 
         if method == "initialize" and resp and "result" in resp:
@@ -530,7 +583,8 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header(
             "Access-Control-Allow-Headers",
-            "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version",
+            "Authorization, Content-Type, Accept, Mcp-Session-Id, "
+            "MCP-Protocol-Version, X-ALS-Map-Write-Token",
         )
         self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", "0")
@@ -552,6 +606,17 @@ def main() -> int:
         f"(protocol {HTTP_PROTOCOL_VERSION}; health /health; max_body {MAX_BODY_BYTES})"
     )
     log("Auth: Bearer token from ALS_MAP_MCP_TOKEN (required; value never logged)")
+    if os.environ.get("ALS_MAP_MCP_WRITE_TOKEN", "").strip():
+        log("Index writes: ALS_MAP_MCP_WRITE_TOKEN set (arg or X-ALS-Map-Write-Token)")
+    elif os.environ.get("ALS_MAP_ALLOW_INDEX_WRITES", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        log("Index writes: ALS_MAP_ALLOW_INDEX_WRITES=1 (no write token)")
+    else:
+        log("Index writes: DISABLED (set ALS_MAP_MCP_WRITE_TOKEN)")
     log(f"Access log: {access_log_path()} (ts ip method path status mcp_method tool)")
     try:
         httpd.serve_forever()

@@ -1,8 +1,8 @@
-# Total ALS Map (Phase 1′ + 2′a + 2′b + 2′c)
+# Total ALS Map (Phase 1′ + 2′a + 2′b + 2′c + named indexes)
 
 Queryable personal corpus: **X posts/replies/reposts/likes/notes + every Grok turn** from the normalized JSONL, indexed in local SQLite FTS5 (+ optional local embeddings) for **retrieval-backed analysis by Grok** (via Cursor MCP tools).
 
-This is a **retrieval map substrate**, not a UI/graph product. Phase **2′a** adds prior-free sample / style / contrast. Phase **2′b** adds **local-only** semantic search (no corpus upload / no remote embed API). Phase **2′c** adds **heuristic thread features** (no LLM labels).
+This is a **retrieval map substrate**, not a UI/graph product. Phase **2′a** adds prior-free sample / style / contrast. Phase **2′b** adds **local-only** semantic search (no corpus upload / no remote embed API). Phase **2′c** adds **heuristic thread features** (no LLM labels). **Named analysis indexes** let agents materialize scoped id sets or saved filters (versioned opinions) and pass `index=` into search/sample/stats/semantic.
 
 ## Corpus boundary (Total v1)
 
@@ -66,6 +66,18 @@ python scripts/build_thread_features.py --force
 ```
 
 Per-thread fields: message counts + human/assistant/self ratio, refine/critique cue counts (regex on `human`|`self`), code/tech density. Documented as approximate in tool output.
+
+## Named analysis indexes
+
+Optional, inspectable, **versioned** opinions stored in the **same** `als_map.sqlite` (tables `analysis_indexes` + `analysis_index_members`). Multiple competing indexes are fine. FTS rebuild copies them forward.
+
+| Kind | Membership |
+|------|------------|
+| `message_ids` | Explicit record `id` list (materialize after `als_sample` / search hits) |
+| `thread_ids` | Explicit `thread_id` list — scopes all messages in those threads |
+| `filter` | Saved `sources` / `role` / `since` / `until`; evaluated at query time |
+
+Typical loop: `als_sample` → `als_index_create(name, kind=message_ids, ids=[…], write_token=…)` → later `als_search` / `als_stats` / `als_semantic_search` with `index=name`. Member writes ≤50 per call (≤5000 total / index; ≤100 indexes); list/get returns ≤50. **Mutations require** `ALS_MAP_MCP_WRITE_TOKEN` via tool arg `write_token` or HTTP header `X-ALS-Map-Write-Token` (Bearer alone is read). Local stdio may set `ALS_MAP_ALLOW_INDEX_WRITES=1` instead.
 
 ## Debug CLI (not the product)
 
@@ -164,7 +176,7 @@ Details: [`docs/als-map-stack.md`](als-map-stack.md). Access log: `~/.local/stat
 
 Live hostname: **`https://mcp.austenstrine.dev`** (tunnel UUID managed under `~/.cloudflared/`, not in git). Example stub: [`docs/cloudflare-tunnel.example.yml`](cloudflare-tunnel.example.yml).
 
-Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in git.
+Keep `ALS_MAP_MCP_TOKEN` and `ALS_MAP_MCP_WRITE_TOKEN` only in `~/.config/als_map/` / process env — never in git. Stack files: `mcp_token`, `mcp_write_token`, `env`.
 
 ### Grok / Cursor remote MCP
 
@@ -172,6 +184,7 @@ Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in
 |-------|-------|
 | URL | `https://mcp.austenstrine.dev/mcp` (local: `http://127.0.0.1:8787/mcp`) |
 | Header | `Authorization: Bearer <ALS_MAP_MCP_TOKEN>` |
+| Write header (optional) | `X-ALS-Map-Write-Token: <ALS_MAP_MCP_WRITE_TOKEN>` for index mutations |
 | Transport | Streamable HTTP (JSON responses supported) |
 
 ```json
@@ -180,7 +193,8 @@ Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in
     "als-map-remote": {
       "url": "https://mcp.austenstrine.dev/mcp",
       "headers": {
-        "Authorization": "Bearer ${ALS_MAP_MCP_TOKEN}"
+        "Authorization": "Bearer ${ALS_MAP_MCP_TOKEN}",
+        "X-ALS-Map-Write-Token": "${ALS_MAP_MCP_WRITE_TOKEN}"
       }
     }
   }
@@ -191,17 +205,23 @@ Keep `ALS_MAP_MCP_TOKEN` only in `~/.config/als_map/` / process env — never in
 
 | Tool | Role |
 |------|------|
-| `als_search` | FTS; snippet-default; filters `sources` / `role` / `since` / `until`; limit ≤50 |
+| `als_search` | FTS; snippet-default; filters `sources` / `role` / `since` / `until` / optional `index`; limit ≤50 |
 | `als_get` | Full text by id (char-capped) |
 | `als_get_many` | Batch get ≤50 ids |
 | `als_thread` | Ordered turns for `thread_id` (default window ≤30) |
-| `als_browse` | Keywordless chronological window |
-| `als_stats` | Counts; breakdown `source` \| `role` \| `month` \| `both` |
-| `als_sample` | Prior-free random sample; `n`≤50; `role?` / `source?` (`x`\|`grok` or specific); `stratify_by` `none`\|`time`\|`thread_length`; `seed?`; optional thread-feature filters (`min_thread_length` / `has_refine` / `has_critique` / `min_code_density`) |
-| `als_style_stats` | Deterministic style aggregates for a slice (`source?` / `role?` / `since?` / `until?`) |
+| `als_browse` | Keywordless chronological window; optional `index` |
+| `als_stats` | Counts; breakdown `source` \| `role` \| `month` \| `both`; optional `sources` / `index` |
+| `als_sample` | Prior-free random sample; `n`≤50; `role?` / `source?` (`x`\|`grok` or specific); optional `index`; `stratify_by` `none`\|`time`\|`thread_length`; `seed?`; optional thread-feature filters (`min_thread_length` / `has_refine` / `has_critique` / `min_code_density`) |
+| `als_style_stats` | Deterministic style aggregates for a slice (`source?` / `role?` / `since?` / `until?` / optional `index`) |
 | `als_contrast` | Two-slice compare (sources and/or time windows) with deltas on the same metrics |
-| `als_semantic_search` | Local embedding NN search; `query`; filters `source(s)?` / `role?` / `since?` / `until?`; limit ≤50 |
+| `als_semantic_search` | Local embedding NN search; `query`; filters `source(s)?` / `role?` / `since?` / `until?` / optional `index`; limit ≤50 |
 | `als_thread_features` | Heuristic per-thread features (no LLM); `thread_id?` or filter/list (`source?` / length / refine / critique / density); limit ≤50 |
+| `als_index_create` | Create named analysis index (`message_ids` \| `thread_ids` \| `filter`); optional initial `ids` ≤50; `replace?` bumps version; **write auth** |
+| `als_index_list` | List indexes ≤50 (read; Bearer only) |
+| `als_index_get` | Inspect one index + member page ≤50 (read; Bearer only) |
+| `als_index_delete` | Drop index + members; **write auth** |
+| `als_index_add_ids` | Append ≤50 members; bumps version; **write auth** |
+| `als_index_replace_members` | Replace member set ≤50; bumps version; **write auth** |
 
 Every hit includes cite fields: `id`, `source`, `created_at`, `url`, `thread_id`, `role`.
 
@@ -220,7 +240,7 @@ Primary ongoing cost is **agent/Grok context tokens**, not index CPU.
 
 | Path | Purpose |
 |------|---------|
-| `scripts/als_map_lib.py` | Shared build + query library (FTS + embeddings + thread features) |
+| `scripts/als_map_lib.py` | Shared build + query library (FTS + embeddings + thread features + named analysis indexes) |
 | `scripts/build_map_index.py` | JSONL → sqlite |
 | `scripts/build_map_embeddings.py` | sqlite → local embedding `.npz` |
 | `scripts/build_thread_features.py` | sqlite → heuristic `thread_features` table |
