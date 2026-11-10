@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-stdio MCP server for the Total ALS Map (Phase 1′ + 2′a + 2′b + 2′c surface).
+stdio MCP server for the Total ALS Map (Phase 1′ + 2′a + 2′b + 2′c + indexes).
 
 Tools (hard-capped via als_map_lib):
   als_search, als_get, als_get_many, als_thread, als_browse, als_stats,
   als_sample, als_style_stats, als_contrast, als_semantic_search,
-  als_thread_features
+  als_thread_features,
+  als_index_create, als_index_list, als_index_get, als_index_delete,
+  als_index_add_ids, als_index_replace_members
 
 Protocol: MCP over JSON-RPC 2.0 on stdin/stdout (Content-Length framing
 compatible with the MCP stdio transport). Core tools are stdlib-only;
@@ -29,6 +31,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
 import sys
 import traceback
 from pathlib import Path
@@ -38,11 +42,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from als_map_lib import (  # noqa: E402
     DEFAULT_DB,
+    REPO_ROOT,
     browse,
     contrast,
     get_many,
     get_one,
+    index_add_ids,
+    index_create,
+    index_delete,
+    index_get,
+    index_list,
+    index_replace_members,
     open_db,
+    open_db_rw,
     sample,
     search,
     semantic_search,
@@ -53,8 +65,35 @@ from als_map_lib import (  # noqa: E402
 )
 
 SERVER_NAME = "als-map"
-SERVER_VERSION = "0.5.1"
+SERVER_VERSION = "0.6.0"
 PROTOCOL_VERSION = "2024-11-05"
+
+# Mutating index tools require ALS_MAP_MCP_WRITE_TOKEN (tool arg or HTTP header
+# injection) unless ALS_MAP_ALLOW_INDEX_WRITES=1 (local stdio trust).
+WRITE_TOKEN_ENV = "ALS_MAP_MCP_WRITE_TOKEN"
+ALLOW_WRITES_ENV = "ALS_MAP_ALLOW_INDEX_WRITES"
+WRITE_TOKEN_ARG = "write_token"
+_PATH_LEAK_RE = re.compile(
+    r"(?:/home|/Users|/var|/tmp|/opt|/usr|/etc)[^\s\"'<>\]}]{0,512}"
+)
+
+INDEX_PARAM = {
+    "type": "string",
+    "description": (
+        "Optional named analysis index to scope results "
+        "(message_ids / thread_ids / filter). Create via als_index_create."
+    ),
+}
+
+WRITE_TOKEN_PARAM = {
+    "type": "string",
+    "description": (
+        "Required write secret matching ALS_MAP_MCP_WRITE_TOKEN "
+        "(or set header X-ALS-Map-Write-Token on HTTP). "
+        "Not needed when ALS_MAP_ALLOW_INDEX_WRITES=1."
+    ),
+}
+
 
 # Log to stderr only — stdout is the MCP transport.
 def log(msg: str) -> None:
@@ -66,13 +105,63 @@ def db_path() -> Path:
     return Path(env) if env else DEFAULT_DB
 
 
+def _scrub_paths(text: str) -> str:
+    """Redact absolute paths from client-facing errors (no FS leak)."""
+    out = text
+    for prefix in (str(REPO_ROOT), str(Path.home()), str(DEFAULT_DB.parent)):
+        if prefix and prefix in out:
+            out = out.replace(prefix, "…")
+    return _PATH_LEAK_RE.sub("…", out)
+
+
+def _public_error(exc: BaseException) -> str:
+    if isinstance(exc, ValueError):
+        msg = str(exc)
+    else:
+        msg = f"{type(exc).__name__}: {exc}"
+    return _scrub_paths(msg)
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _authorize_index_write(args: dict[str, Any]) -> None:
+    """
+    Gate mutating index tools.
+
+    Prefer ALS_MAP_MCP_WRITE_TOKEN (timing-safe compare to write_token arg).
+    Local/dev escape: ALS_MAP_ALLOW_INDEX_WRITES=1 with no write token configured.
+    Fail closed when neither is set (public HTTP must set WRITE_TOKEN).
+    """
+    expected = os.environ.get(WRITE_TOKEN_ENV, "").strip()
+    allow_flag = _truthy_env(ALLOW_WRITES_ENV)
+    if not expected and not allow_flag:
+        raise ValueError(
+            "index writes disabled: set ALS_MAP_MCP_WRITE_TOKEN "
+            f"(pass {WRITE_TOKEN_ARG}=) or {ALLOW_WRITES_ENV}=1 for local trust"
+        )
+    if not expected:
+        return
+    got = str(args.get(WRITE_TOKEN_ARG) or "").strip()
+    # Drop secret from args so it never echoes into tool payloads / traces.
+    args.pop(WRITE_TOKEN_ARG, None)
+    if not got or not secrets.compare_digest(got, expected):
+        raise ValueError(
+            "unauthorized index write: "
+            f"{WRITE_TOKEN_ARG} must match {WRITE_TOKEN_ENV} "
+            "(or send X-ALS-Map-Write-Token on HTTP)"
+        )
+
+
 TOOL_DEFS: list[dict[str, Any]] = [
     {
         "name": "als_search",
         "description": (
             "Keyword search over Austen’s X + Grok corpus (FTS5). "
             "Default returns cite fields + short snippet (not full text). "
-            "Hard limit ≤50. Use als_get / als_get_many for full text."
+            "Hard limit ≤50. Use als_get / als_get_many for full text. "
+            "Optional index= scopes to a named analysis index."
         ),
         "inputSchema": {
             "type": "object",
@@ -85,6 +174,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "role": {"type": "string", "description": "Filter role (human|assistant|self)"},
                 "since": {"type": "string", "description": "ISO-8601 lower bound (inclusive)"},
                 "until": {"type": "string", "description": "ISO-8601 upper bound (exclusive)"},
+                "index": INDEX_PARAM,
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                 "offset": {"type": "integer", "minimum": 0},
                 "max_chars": {
@@ -155,7 +245,8 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "name": "als_browse",
         "description": (
             "Keywordless chronological browse over a time window. "
-            "Use for timeline slices when you do not know the magic keyword."
+            "Use for timeline slices when you do not know the magic keyword. "
+            "Optional index= scopes to a named analysis index."
         ),
         "inputSchema": {
             "type": "object",
@@ -164,6 +255,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "until": {"type": "string"},
                 "sources": {"type": "string"},
                 "role": {"type": "string"},
+                "index": INDEX_PARAM,
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                 "offset": {"type": "integer", "minimum": 0},
                 "max_chars": {"type": "integer"},
@@ -173,7 +265,10 @@ TOOL_DEFS: list[dict[str, Any]] = [
     },
     {
         "name": "als_stats",
-        "description": "Index orientation: record counts and optional breakdown.",
+        "description": (
+            "Index orientation: record counts and optional breakdown. "
+            "Optional sources= / index= scopes the counts."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -182,6 +277,11 @@ TOOL_DEFS: list[dict[str, Any]] = [
                     "enum": ["source", "role", "month", "both", "none"],
                     "default": "source",
                 },
+                "sources": {
+                    "type": "string",
+                    "description": "Comma-separated sources or x|grok shorthand",
+                },
+                "index": INDEX_PARAM,
             },
         },
     },
@@ -190,7 +290,8 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "description": (
             "Prior-free random sample of records (snippet-shaped like als_search). "
             "Optional stratification by time (year-month) or thread_length. "
-            "source accepts x|grok shorthand or specific source names. n≤50."
+            "source accepts x|grok shorthand or specific source names. n≤50. "
+            "Optional index= scopes the eligible pool."
         ),
         "inputSchema": {
             "type": "object",
@@ -201,6 +302,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "x|grok shorthand, or comma-separated sources",
                 },
+                "index": INDEX_PARAM,
                 "stratify_by": {
                     "type": "string",
                     "enum": ["none", "time", "thread_length"],
@@ -242,7 +344,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "Cheap deterministic style aggregates for a filtered slice: count, "
             "mean/median char & word length, question-mark density, follow-up share, "
             "opening bigrams/trigrams (human role by default), approximate register markers. "
-            "No full-text dump."
+            "No full-text dump. Optional index= scopes the slice."
         ),
         "inputSchema": {
             "type": "object",
@@ -254,6 +356,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "role": {"type": "string"},
                 "since": {"type": "string", "description": "ISO-8601 lower bound (inclusive)"},
                 "until": {"type": "string", "description": "ISO-8601 upper bound (exclusive)"},
+                "index": INDEX_PARAM,
             },
         },
     },
@@ -287,7 +390,8 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "Local embedding nearest-neighbor search over the corpus "
             "(sentence-transformers; no remote embed API). "
             "Returns cite fields + snippet + cosine score. Hard limit ≤50. "
-            "Use for concept queries that FTS keywords miss."
+            "Use for concept queries that FTS keywords miss. "
+            "Optional index= scopes candidates to a named analysis index."
         ),
         "inputSchema": {
             "type": "object",
@@ -304,6 +408,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "role": {"type": "string", "description": "Filter role (human|assistant|self)"},
                 "since": {"type": "string", "description": "ISO-8601 lower bound (inclusive)"},
                 "until": {"type": "string", "description": "ISO-8601 upper bound (exclusive)"},
+                "index": INDEX_PARAM,
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                 "max_chars": {
                     "type": "integer",
@@ -351,7 +456,143 @@ TOOL_DEFS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "als_index_create",
+        "description": (
+            "Create a named analysis index in the same map DB (optional; "
+            "multiple competing indexes OK). kind=message_ids|thread_ids|filter. "
+            "After sampling, pass hit ids to materialize a scoped opinion. "
+            "filter kind stores sources/role/since/until and evaluates at query time. "
+            "Version starts at 1; replace=true overwrites and bumps version. "
+            "Requires write_token (or X-ALS-Map-Write-Token)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Index name: ^[a-z][a-z0-9_-]{0,63}$",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["message_ids", "thread_ids", "filter"],
+                    "default": "message_ids",
+                },
+                "description": {"type": "string"},
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 50,
+                    "description": "Initial members (message or thread ids)",
+                },
+                "filter": {
+                    "type": "object",
+                    "description": "Saved filter expr for kind=filter (sources/role/since/until)",
+                },
+                "sources": {"type": "string"},
+                "role": {"type": "string"},
+                "since": {"type": "string"},
+                "until": {"type": "string"},
+                "replace": {
+                    "type": "boolean",
+                    "description": "If true, replace existing index and bump version",
+                },
+                "write_token": WRITE_TOKEN_PARAM,
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "als_index_list",
+        "description": "List named analysis indexes (≤50). Inspectable; includes version + kind.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+        },
+    },
+    {
+        "name": "als_index_get",
+        "description": (
+            "Get one analysis index (metadata + up to 50 member ids, page with offset)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "als_index_delete",
+        "description": (
+            "Delete a named analysis index and its members. "
+            "Requires write_token (or X-ALS-Map-Write-Token)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "write_token": WRITE_TOKEN_PARAM,
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "als_index_add_ids",
+        "description": (
+            "Add up to 50 message/thread ids to an existing id-kind index; bumps version. "
+            "Requires write_token (or X-ALS-Map-Write-Token)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 50,
+                },
+                "write_token": WRITE_TOKEN_PARAM,
+            },
+            "required": ["name", "ids"],
+        },
+    },
+    {
+        "name": "als_index_replace_members",
+        "description": (
+            "Replace all members of an id-kind index with up to 50 ids; bumps version. "
+            "Requires write_token (or X-ALS-Map-Write-Token)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 50,
+                },
+                "write_token": WRITE_TOKEN_PARAM,
+            },
+            "required": ["name", "ids"],
+        },
+    },
 ]
+
+_MUTATING_TOOLS = frozenset(
+    {
+        "als_index_create",
+        "als_index_delete",
+        "als_index_add_ids",
+        "als_index_replace_members",
+    }
+)
 
 
 def _tool_result(payload: dict[str, Any], *, is_error: bool = False) -> dict[str, Any]:
@@ -364,14 +605,23 @@ def _tool_result(payload: dict[str, Any], *, is_error: bool = False) -> dict[str
 
 
 def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
-    args = arguments or {}
+    # Shallow copy so we can pop write_token without mutating caller state.
+    args = dict(arguments or {})
 
     try:
-        conn = open_db(db_path())
-    except FileNotFoundError as exc:
+        if name in _MUTATING_TOOLS:
+            _authorize_index_write(args)
+            conn = open_db_rw(db_path())
+        else:
+            # Defense: never accept write_token on read tools (avoid secret echo).
+            args.pop(WRITE_TOKEN_ARG, None)
+            conn = open_db(db_path())
+    except ValueError as exc:
+        return _tool_result({"error": _public_error(exc)}, is_error=True)
+    except FileNotFoundError:
         return _tool_result(
             {
-                "error": str(exc),
+                "error": "index missing",
                 "hint": "run: python scripts/build_map_index.py",
             },
             is_error=True,
@@ -387,6 +637,7 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                     role=args.get("role"),
                     since=args.get("since"),
                     until=args.get("until"),
+                    index=args.get("index"),
                     limit=args.get("limit"),
                     offset=int(args.get("offset") or 0),
                     max_chars=args.get("max_chars"),
@@ -426,13 +677,19 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                     until=args.get("until"),
                     sources=args.get("sources"),
                     role=args.get("role"),
+                    index=args.get("index"),
                     limit=args.get("limit"),
                     offset=int(args.get("offset") or 0),
                     max_chars=args.get("max_chars"),
                     include_meta=bool(args.get("include_meta")),
                 )
             elif name == "als_stats":
-                payload = stats(conn, breakdown=args.get("breakdown") or "source")
+                payload = stats(
+                    conn,
+                    breakdown=args.get("breakdown") or "source",
+                    index=args.get("index"),
+                    sources=args.get("sources") or args.get("source"),
+                )
             elif name == "als_sample":
                 seed = args.get("seed")
                 min_len = args.get("min_thread_length")
@@ -442,6 +699,7 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                     n=args.get("n"),
                     role=args.get("role"),
                     source=args.get("source") or args.get("sources"),
+                    index=args.get("index"),
                     stratify_by=args.get("stratify_by") or "none",
                     seed=None if seed is None else int(seed),
                     max_chars=args.get("max_chars"),
@@ -459,6 +717,7 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                     role=args.get("role"),
                     since=args.get("since"),
                     until=args.get("until"),
+                    index=args.get("index"),
                 )
             elif name == "als_contrast":
                 payload = contrast(
@@ -481,6 +740,7 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                     role=args.get("role"),
                     since=args.get("since"),
                     until=args.get("until"),
+                    index=args.get("index"),
                     limit=args.get("limit"),
                     max_chars=args.get("max_chars"),
                 )
@@ -507,14 +767,58 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                     limit=args.get("limit"),
                     offset=int(args.get("offset") or 0),
                 )
+            elif name == "als_index_create":
+                filt = args.get("filter")
+                payload = index_create(
+                    conn,
+                    str(args.get("name") or ""),
+                    kind=str(args.get("kind") or "message_ids"),
+                    description=args.get("description"),
+                    ids=args.get("ids"),
+                    filter=filt if isinstance(filt, (dict, str)) or filt is None else None,
+                    sources=args.get("sources") or args.get("source"),
+                    role=args.get("role"),
+                    since=args.get("since"),
+                    until=args.get("until"),
+                    replace=bool(args.get("replace")),
+                )
+            elif name == "als_index_list":
+                payload = index_list(
+                    conn,
+                    limit=args.get("limit"),
+                    offset=int(args.get("offset") or 0),
+                )
+            elif name == "als_index_get":
+                payload = index_get(
+                    conn,
+                    str(args.get("name") or ""),
+                    limit=args.get("limit"),
+                    offset=int(args.get("offset") or 0),
+                )
+            elif name == "als_index_delete":
+                payload = index_delete(conn, str(args.get("name") or ""))
+            elif name == "als_index_add_ids":
+                ids = args.get("ids") or []
+                if not isinstance(ids, list):
+                    raise ValueError("ids must be an array of strings")
+                payload = index_add_ids(
+                    conn, str(args.get("name") or ""), [str(i) for i in ids]
+                )
+            elif name == "als_index_replace_members":
+                ids = args.get("ids") or []
+                if not isinstance(ids, list):
+                    raise ValueError("ids must be an array of strings")
+                payload = index_replace_members(
+                    conn, str(args.get("name") or ""), [str(i) for i in ids]
+                )
             else:
                 return _tool_result({"error": f"unknown tool: {name}"}, is_error=True)
         return _tool_result(payload)
     except ValueError as exc:
-        return _tool_result({"error": str(exc)}, is_error=True)
+        return _tool_result({"error": _public_error(exc)}, is_error=True)
     except Exception as exc:  # noqa: BLE001 — surface to MCP client
         log(traceback.format_exc())
-        return _tool_result({"error": f"{type(exc).__name__}: {exc}"}, is_error=True)
+        return _tool_result({"error": _public_error(exc)}, is_error=True)
 
 
 def handle_message(msg: dict[str, Any]) -> dict[str, Any] | None:

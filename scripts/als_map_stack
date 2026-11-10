@@ -24,6 +24,7 @@ HTTP_UNIT="als-map-mcp-http.service"
 TUNNEL_UNIT="als-map-mcp-tunnel.service"
 CONFIG_DIR="${HOME}/.config/als_map"
 TOKEN_FILE="${CONFIG_DIR}/mcp_token"
+WRITE_TOKEN_FILE="${CONFIG_DIR}/mcp_write_token"
 ENV_FILE="${CONFIG_DIR}/env"
 STATE_DIR="${HOME}/.local/state/als_map"
 ACCESS_LOG="${ALS_MAP_ACCESS_LOG:-${STATE_DIR}/access.log}"
@@ -78,6 +79,25 @@ ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$(dirname "$ACCESS_LOG")"
 }
 
+_env_upsert() {
+  # Upsert KEY=VALUE in ENV_FILE without echoing secrets. Preserves other keys.
+  local key="$1" value="$2"
+  local tmp
+  tmp="$(mktemp)"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    printf '%s=%s\n' "$key" "$value" >"$ENV_FILE"
+  else
+    awk -v k="$key" -v v="$value" '
+      BEGIN{done=0; re="^" k "="}
+      $0 ~ re {print k "=" v; done=1; next}
+      {print}
+      END{if(!done) print k "=" v}
+    ' "$ENV_FILE" >"$tmp"
+    mv "$tmp" "$ENV_FILE"
+  fi
+  chmod 600 "$ENV_FILE"
+}
+
 ensure_token() {
   ensure_dirs
   local token=""
@@ -99,30 +119,46 @@ ensure_token() {
     token="$(openssl rand -hex 32)"
     printf '%s\n' "$token" >"$TOKEN_FILE"
     chmod 600 "$TOKEN_FILE"
-    printf 'ALS_MAP_MCP_TOKEN=%s\n' "$token" >"$ENV_FILE"
-    chmod 600 "$ENV_FILE"
+    _env_upsert "ALS_MAP_MCP_TOKEN" "$token"
     echo "Generated new MCP bearer token → $TOKEN_FILE (+ $ENV_FILE)"
+  else
+    # Keep file + EnvironmentFile aligned without echoing the secret.
+    printf '%s\n' "$token" >"$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    _env_upsert "ALS_MAP_MCP_TOKEN" "$token"
+  fi
+  ensure_write_token
+}
+
+ensure_write_token() {
+  # Separate write secret for als_index_* mutations (public MCP defense-in-depth).
+  ensure_dirs
+  local wtoken=""
+  if [[ -f "$WRITE_TOKEN_FILE" ]]; then
+    wtoken="$(tr -d ' \t\r\n' <"$WRITE_TOKEN_FILE")"
+  fi
+  if [[ -z "$wtoken" && -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    wtoken="$(
+      set -a
+      # shellcheck source=/dev/null
+      source "$ENV_FILE"
+      set +a
+      printf '%s' "${ALS_MAP_MCP_WRITE_TOKEN:-}"
+    )"
+    wtoken="$(printf '%s' "$wtoken" | tr -d ' \t\r\n')"
+  fi
+  if [[ -z "$wtoken" ]]; then
+    wtoken="$(openssl rand -hex 32)"
+    printf '%s\n' "$wtoken" >"$WRITE_TOKEN_FILE"
+    chmod 600 "$WRITE_TOKEN_FILE"
+    _env_upsert "ALS_MAP_MCP_WRITE_TOKEN" "$wtoken"
+    echo "Generated new MCP write token → $WRITE_TOKEN_FILE (+ $ENV_FILE)"
     return 0
   fi
-  # Keep file + EnvironmentFile aligned without echoing the secret.
-  printf '%s\n' "$token" >"$TOKEN_FILE"
-  chmod 600 "$TOKEN_FILE"
-  if [[ ! -f "$ENV_FILE" ]] || ! grep -q '^ALS_MAP_MCP_TOKEN=' "$ENV_FILE" 2>/dev/null; then
-    printf 'ALS_MAP_MCP_TOKEN=%s\n' "$token" >"$ENV_FILE"
-    chmod 600 "$ENV_FILE"
-  else
-    # Rewrite only the token line; preserve other keys if any appear later.
-    local tmp
-    tmp="$(mktemp)"
-    awk -v t="$token" '
-      BEGIN{done=0}
-      /^ALS_MAP_MCP_TOKEN=/ {print "ALS_MAP_MCP_TOKEN=" t; done=1; next}
-      {print}
-      END{if(!done) print "ALS_MAP_MCP_TOKEN=" t}
-    ' "$ENV_FILE" >"$tmp"
-    mv "$tmp" "$ENV_FILE"
-    chmod 600 "$ENV_FILE"
-  fi
+  printf '%s\n' "$wtoken" >"$WRITE_TOKEN_FILE"
+  chmod 600 "$WRITE_TOKEN_FILE"
+  _env_upsert "ALS_MAP_MCP_WRITE_TOKEN" "$wtoken"
 }
 
 unit_state() {
@@ -214,6 +250,7 @@ cmd_status() {
   echo "  $(dim "repo")     $REPO_ROOT"
   echo "  $(dim "checkout") $git_branch @ $git_head"
   echo "  $(dim "token")    $TOKEN_FILE $( [[ -s "$TOKEN_FILE" ]] && ok || bad )"
+  echo "  $(dim "write")    $WRITE_TOKEN_FILE $( [[ -s "$WRITE_TOKEN_FILE" ]] && ok || bad )"
   echo "  $(dim "env")      $ENV_FILE $( [[ -s "$ENV_FILE" ]] && ok || bad )"
   echo "  $(dim "access")   $ACCESS_LOG"
   echo
@@ -289,6 +326,7 @@ cmd_doctor() {
     || check "http script" 0 "missing"
 
   [[ -s "$TOKEN_FILE" ]] && check "mcp_token" 1 "$TOKEN_FILE" || check "mcp_token" 0 "missing/empty"
+  [[ -s "$WRITE_TOKEN_FILE" ]] && check "mcp_write_token" 1 "$WRITE_TOKEN_FILE" || check "mcp_write_token" 0 "missing/empty"
   [[ -s "$ENV_FILE" ]] && check "env file" 1 "$ENV_FILE" || check "env file" 0 "missing/empty"
 
   systemctl --user cat "$HTTP_UNIT" >/dev/null 2>&1 \
